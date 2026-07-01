@@ -1,0 +1,17 @@
+plan.txt
+
+# Local research data — never commit (large / restricted / regenerable)
+gi_app/etl/landing/
+Data/
+*.svs
+*.tar.gz
+gdc_manifest_*.txt
+screenshot
+screenshot.pdf
+Data.xlsx
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.venv/

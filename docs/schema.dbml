@@ -1,0 +1,592 @@
+// GI Cancer Research Platform — Phase 1 schema
+// Docs: https://dbml.dbdiagram.io/docs
+//
+// One Postgres database holds catalog + clinical + biospecimen + curation + file
+// pointers. The only data kept OUT of Postgres are the slide image binaries (.svs),
+// which live in object storage and are referenced by `data_assets` (asset_type='wsi').
+//
+// Design rules (see docs/DB_DESIGN_BRIEF.md "Decisions finalized"):
+//  - GDC UUID = primary key; the TCGA barcode (`submitter_id`) is a plain indexed column.
+//  - Staging/TNM live on `diagnoses` (per-diagnosis in the data), never on `cases`.
+//  - Survival (OS/DSS/PFI/DFI) is a derived VIEW (`case_survival`), not a stored table.
+//  - `dataset_id` lives only on `cases` and `data_assets`; derive it elsewhere via the FK
+//    chain (slide → sample → case → dataset). No redundant denormalization.
+//  - The downloaded TSVs are raw input; ETL resolves barcodes → UUID FKs into this schema.
+//  - Source clinical vocabularies (AJCC stage/T/N/M, edition, tumor/treatment classes, etc.)
+//    are `varchar` validated+normalized in ETL — NOT Postgres enums — because values vary
+//    across GI projects and even COAD alone already breaks fixed enums (T1a/T2c/T3a, edition
+//    "2nd", classification "recurrence"). Only truly CLOSED vocabularies stay enums (sex,
+//    vital_status, race, ethnicity, yes_no, tissue_type, section_location, run/asset/access/
+//    connector types).
+//  - `diagnoses` also holds non-GI prior/synchronous primaries (e.g. Larynx, Breast). Any
+//    stage/site feature and the `case_survival` view MUST restrict to
+//    `diagnosis_is_primary_disease = true`.
+
+// ============================================================================
+// Enums — ONLY closed/stable controlled vocabularies. Evolving source vocabularies
+// are varchar (validated in ETL); see design rules above.
+// ============================================================================
+
+Enum dataset_access_type {
+  public
+  controlled
+  mixed                                // open + controlled tiers (e.g. TCGA)
+  private
+}
+
+Enum ingest_connector {
+  tcga_ingest                          // TCGA projects via the NCI GDC API
+  geo_ingest                           // GEO / NCBI series (future)
+}
+
+Enum run_status {
+  success
+  failed
+  partial
+}
+
+// case demographics (small, fixed GDC vocabularies)
+Enum sex_at_birth {
+  male
+  female
+  unknown
+}
+
+Enum vital_status {
+  alive
+  dead
+  not_reported
+}
+
+Enum race {
+  white
+  black_or_african_american
+  asian
+  american_indian_or_alaska_native
+  native_hawaiian_or_other_pacific_islander
+  not_reported
+}
+
+Enum ethnicity {
+  hispanic_or_latino
+  not_hispanic_or_latino
+  not_reported                         // ETL folds stray "Unknown" here
+}
+
+// shared yes/no/not-reported (reused across clinical tables)
+Enum yes_no {
+  yes
+  no
+  not_reported
+}
+
+// biospecimen: tumor/normal rollup — a genuinely closed 2-value vocab
+Enum tissue_type {
+  tumor
+  normal
+}
+
+Enum section_location {
+  top
+  bottom
+  not_reported
+}
+
+// data_assets (file pointers)
+Enum asset_type {
+  wsi                                  // whole-slide image (.svs); add types as onboarded
+}
+
+Enum asset_layer {
+  bronze                               // raw (e.g. downloaded .svs)
+  silver
+  gold
+}
+
+// ============================================================================
+// Catalog & provenance
+// ============================================================================
+
+// Lean catalog: only verifiable facts that aren't derivable from the loaded data.
+// Dropped from the old draft (all derivable, subjective prose, or source-level repetition):
+//   category, source, modality, n_samples, matrix_rows/cols, survival_labels_available,
+//   outcome_fields, clinical_vars, file_formats, access_steps, quality_concerns,
+//   ai_suitability, recommended_use, readiness_score/breakdown.
+//   - counts (n_cases, n_files)  -> derived (see dataset_stats view below)
+//   - licensing + citation       -> docs / a data paper (source-level, not per-dataset)
+//   - created_at / update time   -> ingestion_runs (latest run per dataset_id)
+Table datasets {
+  dataset_id              integer      [primary key, note: 'our own surrogate id']
+  name                    varchar      [not null, note: 'TCGA-COAD, GSE39582, ...']
+  access_type             dataset_access_type [not null]
+  official_page           varchar      [note: 'source URL; also identifies the provider (GDC/GEO/...)']
+  gi_cancer_types         varchar      [note: 'e.g. Colon adenocarcinoma']
+}
+
+// Derived counts — a VIEW, not stored columns (always accurate, never stale):
+//   CREATE VIEW dataset_stats AS
+//   SELECT d.dataset_id,
+//          COUNT(DISTINCT c.case_id)  AS n_cases,
+//          COUNT(DISTINCT a.asset_id) AS n_files
+//   FROM datasets d
+//   LEFT JOIN cases c       ON c.dataset_id = d.dataset_id
+//   LEFT JOIN data_assets a ON a.dataset_id = d.dataset_id
+//   GROUP BY d.dataset_id;
+
+// Lean audit log: one row per ETL run. "What this run did" detail lives in the
+// run log (log_uri); current totals come from the dataset_stats view. So per-run
+// counts (n_cases/samples/assets) and free-text notes were dropped.
+Table ingestion_runs {
+  run_id                  integer          [primary key]
+  dataset_id              integer          [not null]
+  connector               ingest_connector [not null, note: 'which loader produced this run']
+  started_at              timestamp
+  finished_at             timestamp
+  status                  run_status       [not null]
+  log_uri                 varchar          [note: 'pointer to the full run log in object storage']
+
+  indexes {
+    dataset_id
+  }
+}
+
+// ============================================================================
+// Clinical (per case)
+// ============================================================================
+
+// The patient. Center of the schema — nearly everything FKs back here. 461 rows.
+// Demographics are folded in (1:1 with the case in the data). Staging/survival are
+// deliberately NOT here: staging lives on diagnoses; survival is the case_survival view.
+Table cases {
+  case_id                 uuid          [primary key, note: 'GDC case UUID']
+  dataset_id              integer       [not null, note: 'FK -> datasets; one of only two places dataset_id lives']
+  submitter_id            varchar       [not null, note: 'TCGA barcode, e.g. TCGA-AA-3562; the join key everything else uses. UNIQUE per dataset']
+  disease_type            varchar       [note: 'broad GDC histology family, e.g. Adenomas and Adenocarcinomas; finer dx on diagnoses. varchar = large source vocab, validated in ETL']
+  primary_site            varchar       [note: 'anatomical site: Colon | Rectosigmoid junction. varchar = large source vocab']
+  sex_at_birth            sex_at_birth  [note: 'core biological sex; replaces the duplicate gender column']
+  race                    race
+  ethnicity               ethnicity
+  vital_status            vital_status  [note: 'OS event source for case_survival; Dead <=> days_to_death is set']
+  days_to_death           integer       [note: 'days from index to death, null if alive; OS time source. Age moved to diagnoses.age_at_diagnosis']
+  lost_to_followup        yes_no        [note: 'QC: patient lost to follow-up. Yes => the Alive status is unreliable (all 14 Yes in COAD are "Alive"); weakens OS censoring. Kept for survival QC']
+  country_of_residence_at_enrollment varchar [note: 'mild batch / tissue-source-site confounder']
+  // family history folded in from family_histories (0:1, patient-level attribute)
+  relative_with_cancer_history yes_no   [note: 'any relative with cancer history (Lynch/hereditary risk signal)']
+  relatives_with_cancer_history_count integer [note: 'how many relatives; filled only when yes (sparse)']
+
+  indexes {
+    dataset_id
+    (dataset_id, submitter_id) [unique]
+  }
+}
+
+// One row per diagnosis (461 cases -> 648 rows; synchronous/secondary diagnoses add rows).
+// Staging/TNM live here. Many GDC fields dropped as empty/constant in COAD (see removal log).
+// NOTE: 187/648 rows are diagnosis_is_primary_disease=False — prior/synchronous primaries,
+// some NON-GI (Larynx, Breast, Prostate). Cohort/stage/survival queries filter to primary.
+Table diagnoses {
+  diagnosis_id            uuid                 [primary key]
+  case_id                 uuid                 [not null, note: 'ETL resolves case_submitter_id -> case_id']
+  submitter_id            varchar              [note: 'diagnosis barcode, e.g. TCGA-AA-3562_diagnosis / _diagnosis2 (suffix flags primary vs synchronous)']
+  primary_diagnosis       varchar              [note: 'specific histology text, e.g. Adenocarcinoma, NOS. Kept over the 1:1 morphology code (more portable across datasets)']
+  tissue_or_organ_of_origin varchar            [note: 'ORGAN this diagnosis row is about (raw diagnoses.tsv column INDEX 4). Populated for ALL rows incl non-GI prior primaries (Larynx/Breast/...); the field that separates the GI primary from other-organ diagnoses. The raw TSV has TWO columns both literally named site_of_resection_or_biopsy — ETL must read this by column index, not name']
+  site_of_resection_or_biopsy varchar          [note: 'colon RESECTION/biopsy sub-site, e.g. Sigmoid colon (raw diagnoses.tsv column INDEX 10; "Not Reported" on non-colon rows). Distinct GDC field from tissue_or_organ_of_origin; both kept, both read by index']
+  ajcc_pathologic_stage   varchar              [note: 'headline AJCC stage (summary of T/N/M); varchar, ETL-normalized (values vary across GI projects)']
+  ajcc_pathologic_t       varchar              [note: 'tumor extent / depth of invasion; varchar (COAD has T1a/T2c/T3a beyond a fixed enum)']
+  ajcc_pathologic_n       varchar              [note: 'regional lymph-node involvement; varchar']
+  ajcc_pathologic_m       varchar              [note: 'distant metastasis; varchar']
+  ajcc_staging_system_edition varchar          [note: 'AJCC manual edition (COAD spans 2nd..7th); varchar, needed to compare stages across editions/datasets']
+  residual_disease        varchar              [note: 'surgical margin outcome: R0 clean / R1 micro / R2 gross; varchar']
+  age_at_diagnosis        integer              [note: 'age at diagnosis in YEARS (ETL converts from raw days); the single age field']
+  year_of_diagnosis       integer              [note: 'calendar year of diagnosis; era/batch signal, non-derivable from privacy-shifted day fields']
+  days_to_last_follow_up  integer              [note: 'days from index to last contact; OS censoring time. Feeds case_survival']
+  prior_malignancy        yes_no               [note: 'prior cancer; confounder, and source of some GDC annotations']
+  prior_treatment         yes_no               [note: 'treatment before this diagnosis; confounder']
+  classification_of_tumor varchar              [note: 'role of this record: primary / metastasis / recurrence / prior primary / synchronous primary; varchar (COAD has "recurrence" beyond a fixed enum)']
+  diagnosis_is_primary_disease boolean         [note: 'True = patient main diagnosis; False = synchronous/secondary (incl non-GI). Primary cohort filter']
+  synchronous_malignancy  yes_no               [note: 'another cancer present at the same time']
+  created_datetime        timestamp            [note: 'GDC record timestamps, kept for provenance']
+  updated_datetime        timestamp
+
+  indexes {
+    case_id
+  }
+}
+
+// One row per treatment event (1734 rows / 408 cases). Inherently SPARSE — TCGA records
+// little treatment detail. Sparse-but-meaningful fields are kept (future datasets may
+// populate them); only empty/constant/duplicate columns were dropped (see removal log).
+// Note: ~915 rows are treatment_or_therapy='no' negative stubs (ETL may load only actual treatments).
+Table treatments {
+  treatment_id            uuid              [primary key]
+  case_id                 uuid              [not null]
+  diagnosis_id            uuid              [note: 'parent diagnosis']
+  submitter_id            varchar           [note: 'e.g. TCGA-AA-3562_treatment4']
+  treatment_type          varchar           [note: 'modality: radiation / chemo / pharmaceutical / surgery / ...; varchar, ETL-normalized']
+  treatment_or_therapy    yes_no            [note: 'was it actually given (raw "unknown" -> not_reported)']
+  treatment_intent_type   varchar           [note: 'why treated: adjuvant / palliative; varchar']
+  therapeutic_agents      varchar           [note: 'drug(s): Fluorouracil, Oxaliplatin, ... (FOLFOX); free text']
+  treatment_outcome       varchar           [note: 'RECIST response where recorded; varchar']
+  initial_disease_status  varchar           [note: 'disease status at treatment start: Unknown / Progressive / Recurrent']
+  number_of_cycles        integer           [note: 'chemo cycles (sparse)']
+  number_of_fractions     integer           [note: 'radiation fractions (sparse)']
+  treatment_dose          float             [note: 'administered dose (sparse; future datasets may fill)']
+  treatment_dose_units    varchar
+  prescribed_dose         float             [note: 'prescribed dose (sparse)']
+  prescribed_dose_units   varchar
+  regimen_or_line_of_therapy varchar        [note: 'e.g. FOLFOX / FOLFIRI (sparse but meaningful)']
+  clinical_trial_indicator yes_no           [note: 'part of a clinical trial']
+  days_to_treatment_start integer
+  days_to_treatment_end   integer
+  created_datetime        timestamp         [note: 'GDC record timestamps, kept for provenance']
+  updated_datetime        timestamp
+
+  indexes {
+    case_id
+    diagnosis_id
+  }
+}
+
+// Pathologist's specimen exam, 0:1 with a diagnosis (460 rows; only primary diagnoses).
+// Kept separate from diagnoses (optional + distinct concept) rather than folded in.
+// Lymph-node counts + invasion markers are key colorectal prognostic features.
+Table pathology_details {
+  pathology_detail_id     uuid     [primary key]
+  case_id                 uuid     [not null]
+  diagnosis_id            uuid     [note: '0:1 with diagnosis (primary diagnoses only)']
+  submitter_id            varchar  [note: 'e.g. TCGA-AA-3562_pathology_detail']
+  lymph_nodes_positive    integer  [note: 'count of cancer-positive nodes; drives N-stage']
+  lymph_nodes_tested      integer  [note: 'count of nodes examined; >=12 is the adequacy threshold']
+  vascular_invasion_present    yes_no  [note: 'tumor in blood vessels; prognostic']
+  lymphatic_invasion_present   yes_no  [note: 'tumor in lymphatics; prognostic']
+  perineural_invasion_present  yes_no  [note: 'tumor around nerves; prognostic']
+  non_nodal_tumor_deposits     yes_no  [note: 'tumor deposits not in nodes; prognostic']
+  circumferential_resection_margin float [note: 'distance to radial margin in mm (sparse but meaningful)']
+  consistent_pathology_review  yes_no  [note: 'QC flag: was the path review internally consistent. CONSTANT Yes in COAD — see WATCH LIST']
+  created_datetime        timestamp [note: 'GDC record timestamps, kept for provenance']
+  updated_datetime        timestamp
+
+  indexes {
+    case_id
+    diagnosis_id
+  }
+}
+
+// Longitudinal timepoints per patient. Supplies the survival view: days_to_follow_up
+// (OS censoring) + the recurrence cluster (DFI/PFI) that was empty on diagnoses.
+// ETL DE-DUP CAUTION: raw has 2642 rows; 1163 are contentless. Of those, 695 are the
+// empty PARENT containers of molecular_tests — but molecular_tests now FKs to case_id
+// (not follow_up_id), so those parents are safe to drop. Load the ~1479 content-bearing rows.
+Table follow_ups {
+  follow_up_id            uuid               [primary key]
+  case_id                 uuid               [not null]
+  submitter_id            varchar            [note: 'e.g. TCGA-AA-3562_follow_up2']
+  timepoint_category      varchar            [note: 'Follow-up / Last Contact / Post Initial Treatment; varchar']
+  days_to_follow_up       integer            [note: 'days from index to this contact; OS censoring (last known alive)']
+  disease_response        varchar            [note: 'disease status at visit: tumor_free / with_tumor; varchar']
+  progression_or_recurrence yes_no           [note: 'did the cancer come back']
+  days_to_recurrence      integer            [note: 'DFI time (sparse but meaningful)']
+  days_to_progression     integer            [note: 'PFI time (sparse but meaningful)']
+  progression_or_recurrence_type varchar     [note: 'distant / locoregional; varchar']
+  progression_or_recurrence_anatomic_site varchar [note: 'where it recurred, e.g. Liver / Lung; open vocab']
+  created_datetime        timestamp          [note: 'GDC record timestamps, kept for provenance']
+  updated_datetime        timestamp
+
+  indexes {
+    case_id
+  }
+}
+
+// Clinical lab/biomarker assays (NOT genomic MAF). Heterogeneous: meaning of
+// test_value/units depends on the assay (antigen/gene). Holds key colorectal markers:
+// CEA blood levels, MMR protein IHC (MLH1/MSH2/MSH6/PMS2), MSI status, KRAS codon.
+// Parent-link change: in the raw data every molecular test is nested under an EMPTY
+// follow-up container (695/695 carry only ids, no clinical content). So we DROP the
+// follow_up_id FK and attach directly to case_id (present on all 695). No data lost.
+Table molecular_tests {
+  molecular_test_id       uuid         [primary key]
+  case_id                 uuid         [not null, note: 'sole parent (was follow_up_id -> empty container); ETL resolves case_submitter_id']
+  submitter_id            varchar      [note: 'e.g. TCGA-AZ-4681_molecular_test']
+  timepoint_category      varchar      [note: 'when taken, e.g. Preoperative (constant in COAD — see WATCH LIST)']
+  molecular_analysis_method varchar    [note: 'method: IHC / ... (open vocab; constant IHC in COAD)']
+  laboratory_test         varchar      [note: 'named test, e.g. Microsatellite Instability']
+  gene_symbol             varchar      [note: 'gene tested, e.g. MLH1/MSH2/MSH6/PMS2 (MMR); Not Applicable for CEA']
+  antigen                 varchar      [note: 'antigen measured, e.g. CEA (constant in COAD — see WATCH LIST)']
+  variant_type            varchar      [note: 'e.g. Mutation, NOS (sparse)']
+  mutation_codon          varchar      [note: 'e.g. 12 / 13 (KRAS) (sparse)']
+  test_result             varchar      [note: 'categorical result: Test Value Reported / Normal / Negative / Positive / Loss of Expression; varchar']
+  test_value              float        [note: 'numeric value, e.g. CEA 15.1']
+  test_units              varchar      [note: 'e.g. ng/mL (constant in COAD — see WATCH LIST)']
+  created_datetime        timestamp    [note: 'GDC record timestamps, kept for provenance']
+  updated_datetime        timestamp
+
+  indexes {
+    case_id
+  }
+}
+
+// family_histories was FOLDED into cases (0:1 patient-level attribute) — see cases table.
+
+// exposures TABLE DROPPED — empty in COAD (1 row, no real data). Re-add (modeled
+// against real columns) when a smoking/alcohol-rich GI dataset is onboarded.
+
+// ============================================================================
+// Biospecimen (per sample). The raw TSVs carry the patient link as the BARCODE
+// (`case_submitter_id`), never the case UUID — so ETL resolves barcode → case_id
+// ONCE at load time (a 461-row lookup, not a per-query cost).
+//
+// `case_id` on portions/analytes/aliquots/slides is a DELIBERATE, controlled
+// denormalization: the case is also reachable via sample (child → sample → case),
+// but a direct case_id keeps "everything for patient X" a single join and keeps
+// the whole schema joining on UUIDs. ETL INVARIANT: a child's case_id MUST equal
+// its sample's case_id (the convenience copy can never drift).
+// ============================================================================
+
+// One row per physical specimen taken from a patient (1490 rows / 461 cases).
+// The -01A/-10A barcode suffix encodes sample_type+vial. Bridge from clinical -> slides.
+Table samples {
+  sample_id               uuid         [primary key]
+  case_id                 uuid         [not null]
+  submitter_id            varchar      [not null, note: 'sample barcode, e.g. TCGA-AA-3562-01A (suffix = type+vial)']
+  sample_type             varchar      [note: 'finest tumor/normal classification: Primary Tumor / Blood Derived Normal / Solid Tissue Normal / Metastatic / Recurrent Tumor; varchar, master of tissue_type']
+  tissue_type             tissue_type  [note: 'tumor/normal rollup of sample_type; closed 2-value enum, kept for convenient filtering']
+  specimen_type           varchar      [note: 'physical material: Solid Tissue / Peripheral Blood NOS / Unknown; varchar']
+  preservation_method     varchar      [note: 'FFPE vs OCT(frozen) — drives slide type/quality; varchar']
+  pathology_report_uuid   varchar      [note: 'pointer to source pathology-report file (sparse)']
+  longest_dimension       float        [note: 'specimen size, cm (sparse)']
+  shortest_dimension      float        [note: 'specimen size, cm (sparse)']
+  intermediate_dimension  float        [note: 'specimen size, cm (sparse)']
+  initial_weight          float        [note: 'specimen weight, mg (sparse)']
+  days_to_collection      integer      [note: 'days from index to collection (sparse)']
+  created_datetime        timestamp    [note: 'GDC record timestamps, kept for provenance']
+  updated_datetime        timestamp
+
+  indexes {
+    case_id
+    submitter_id [unique]                // sample barcode is 1:1 with a sample
+  }
+}
+
+// A portion is a physical piece cut from a sample (2357 rows / 1490 samples). Thin
+// molecular-prep table (portions -> analytes -> aliquots exist mainly for sequencing).
+Table portions {
+  portion_id              uuid         [primary key]
+  case_id                 uuid         [not null]
+  sample_id               uuid         [not null]
+  submitter_id            varchar      [note: 'portion barcode, e.g. TCGA-AA-3562-01A-11']
+  portion_number          varchar      [note: 'sequence no. (e.g. 11); DERIVABLE from submitter_id last segment — kept for convenience']
+  weight                  float        [note: 'portion weight, mg (sparse)']
+  is_ffpe                 boolean      [note: 'FFPE vs frozen at portion level']
+  creation_datetime       integer      [note: 'real lab creation date as Unix epoch (~2011); distinct from GDC created_datetime']
+  created_datetime        timestamp    [note: 'GDC record timestamps, kept for provenance']
+  updated_datetime        timestamp
+
+  indexes {
+    sample_id
+    case_id
+  }
+}
+
+// An analyte is the extracted molecule (DNA/RNA) from a portion (3198 rows). Holds
+// nucleic-acid quality metrics. Barcode suffix -02T/-02D = RNA/DNA analyte type.
+Table analytes {
+  analyte_id              uuid         [primary key]
+  case_id                 uuid         [not null]
+  sample_id               uuid         [not null]
+  submitter_id            varchar      [note: 'analyte barcode, e.g. TCGA-AA-3562-01A-02T']
+  analyte_type            varchar      [note: 'DNA / RNA / Total RNA / Repli-G DNA ...; varchar (vendor variants), ETL can normalize to DNA/RNA']
+  experimental_protocol_type varchar   [note: 'extraction protocol, e.g. Allprep RNA Extraction']
+  concentration           float        [note: 'ng/uL']
+  spectrophotometer_method varchar     [note: 'UV Spec / PicoGreen']
+  a260_a280_ratio         float        [note: 'DNA/RNA purity ratio (~1.8-2.0 clean)']
+  ribosomal_rna_28s_16s_ratio float    [note: 'RNA quality']
+  rna_integrity_number    float        [note: 'RIN, RNA quality score 1-10 (higher = intact)']
+  normal_tumor_genotype_snp_match yes_no [note: 'QC: tumor genotype matches matched-normal (no swap). CONSTANT Yes in COAD — see WATCH LIST, revisit with more datasets']
+  created_datetime        timestamp    [note: 'GDC record timestamps, kept for provenance']
+  updated_datetime        timestamp
+
+  indexes {
+    sample_id
+    case_id
+  }
+}
+
+// An aliquot is a measured sub-portion of an analyte prepared for an assay (9159 rows,
+// the largest table). Barcode adds plate/aliquot segments. The 8 sequencing-selection
+// flags were all dropped (genomics-workflow routing, not pathology — see removal log).
+Table aliquots {
+  aliquot_id              uuid         [primary key]
+  case_id                 uuid         [not null]
+  sample_id               uuid         [not null]
+  submitter_id            varchar      [note: 'full aliquot barcode, e.g. TCGA-AA-3562-01A-02T-0822-13']
+  aliquot_quantity        float        [note: 'amount of material, ug']
+  aliquot_volume          float        [note: 'volume, uL']
+  concentration           float        [note: 'ng/uL']
+  source_center           varchar      [note: 'BCR/sequencing center code (22/23); mild batch signal']
+  created_datetime        timestamp    [note: 'GDC record timestamps, kept for provenance']
+  updated_datetime        timestamp
+
+  indexes {
+    sample_id
+    case_id
+  }
+}
+
+// slide METADATA entity (tumor %, section, etc.) — distinct from the .svs IMAGE,
+// which is a data_assets row (asset_type='wsi'). Linked by barcode = submitter_id.
+// Slide METADATA entity (1493 rows) — the pathologist's cellularity panel. DISTINCT from
+// the .svs IMAGE (a data_assets row, asset_type='wsi'), which joins here by submitter_id.
+// ETL: slide_type is derived from the barcode suffix; de-dup ~25 repeated slide_ids.
+Table slides {
+  slide_id                uuid         [primary key]
+  case_id                 uuid         [not null]
+  sample_id               uuid         [not null]
+  submitter_id            varchar      [not null, note: 'slide barcode, e.g. TCGA-AA-3562-01A-01-BS1; joins to the .svs image in data_assets']
+  slide_type              varchar      [note: 'DX/TS/BS/MS, derived from barcode suffix; DX = diagnostic FFPE H&E. varchar (derived label)']
+  section_location        section_location
+  percent_tumor_cells     float        [note: '% tumor cells; key usability QC']
+  percent_tumor_nuclei    float        [note: '% tumor nuclei; molecular purity']
+  percent_normal_cells    float
+  percent_stromal_cells   float
+  percent_necrosis        float        [note: '% dead tissue; key QC']
+  percent_lymphocyte_infiltration float [note: 'TILs; important pathology-AI feature (sparse)']
+  percent_neutrophil_infiltration float [note: 'immune infiltrate (sparse)']
+  percent_monocyte_infiltration float  [note: 'immune infiltrate (sparse)']
+  created_datetime        timestamp    [note: 'GDC record timestamps, kept for provenance']
+  updated_datetime        timestamp
+
+  indexes {
+    sample_id
+    case_id
+    submitter_id [unique]                // slide barcode is 1:1 with a slide (after ETL de-dups the ~25 identical rows); guarantees the .svs image → slide match is 1-to-1
+  }
+}
+
+// ============================================================================
+// Curation
+// ============================================================================
+
+// GDC curation/QC flags. NOT training labels — used as QC filters (exclude DNU /
+// withdrawn-consent) and confounders (prior malignancy). Polymorphic: each row annotates
+// an entity named by (entity_type, entity_submitter_id).
+// ETL LOADS ONLY barcode-resolvable entity types (case / aliquot / portion / analyte /
+// sample / slide / protein_expression ≈ 1116 rows) and resolves case_id from the barcode
+// prefix. The ~2429 genomic-file rows (annotated/aggregated/masked/simple somatic_mutation,
+// copy_number_*, structural_variation) carry a FILE UUID, not a barcode — no case is
+// derivable and the referenced files are out of scope — so they are SKIPPED (raw
+// annotations.tsv kept on disk for audit).
+Table annotations {
+  annotation_id           uuid                   [primary key]
+  entity_type             varchar                [note: 'what the annotation is about; only barcode-based types are loaded (see table note); varchar']
+  entity_submitter_id     varchar                [not null, note: 'the entity barcode (raw polymorphic ref); barcode for loaded rows']
+  case_id                 uuid                   [note: 'FK; ETL-resolved from the entity_submitter_id barcode prefix (always set for loaded rows)']
+  category                varchar                [note: 'QC reason + main filter: Item flagged DNU / Prior malignancy / ... (16 values, some long)']
+  classification          varchar                [note: 'Notification / Redaction / CenterNotification / Observation; varchar']
+  notes                   text                   [note: 'free-text detail']
+  created_datetime        timestamp              [note: 'kept for provenance']
+
+  indexes {
+    entity_submitter_id
+    case_id
+  }
+}
+
+// RESERVED (Phase 2, not built now): a future `slide_labels` table for real
+// pathology-AI labels on slides — region masks, cell/nuclei annotations,
+// slide-level prognostic labels (see plan.txt Phase 2). Those are TRAINING labels
+// and get their OWN table; do NOT overload `annotations` (which is GDC admin/QC
+// notes only). Will FK to `slides` (and/or the .svs data_asset).
+
+// ============================================================================
+// File pointers → object storage (Group A binaries live as files, not in DB)
+// ============================================================================
+
+// OUR pointer table (not a GDC TSV) — one row per Group-A file in object storage.
+// Built by ETL from slides_manifest.tsv. The bridge from Postgres to the .svs images.
+Table data_assets {
+  asset_id                integer      [primary key]
+  dataset_id              integer      [not null, note: 'FK -> datasets; one of only two places dataset_id lives']
+  slide_id                uuid         [note: 'nullable FK -> slides; set for asset_type=wsi']
+  asset_type              asset_type   [note: 'wsi now; grows as new big-file types are onboarded']
+  layer                   asset_layer  [note: 'medallion layer; raw .svs = bronze']
+  uri                     varchar      [not null, note: 's3://gi-cancer/bronze/TCGA-COAD/slides/<file>.svs']
+  format                  varchar      [note: 'svs, parquet, ...']
+  md5                     varchar      [note: 'integrity checksum (verified on download)']
+  size_bytes              bigint       [note: 'file size']
+  source_file_id          varchar      [note: 'GDC file UUID; provenance / re-download']
+  created_at              timestamp
+
+  indexes {
+    dataset_id
+    slide_id
+  }
+}
+
+// ============================================================================
+// Relationships
+// ============================================================================
+Ref: ingestion_runs.dataset_id   > datasets.dataset_id
+Ref: cases.dataset_id            > datasets.dataset_id
+
+Ref: diagnoses.case_id           > cases.case_id
+Ref: treatments.case_id          > cases.case_id
+Ref: treatments.diagnosis_id     > diagnoses.diagnosis_id
+Ref: pathology_details.case_id   > cases.case_id
+Ref: pathology_details.diagnosis_id > diagnoses.diagnosis_id
+Ref: follow_ups.case_id          > cases.case_id
+Ref: molecular_tests.case_id     > cases.case_id
+
+Ref: samples.case_id             > cases.case_id
+Ref: portions.sample_id          > samples.sample_id
+Ref: portions.case_id            > cases.case_id
+Ref: analytes.sample_id          > samples.sample_id
+Ref: analytes.case_id            > cases.case_id
+Ref: aliquots.sample_id          > samples.sample_id
+Ref: aliquots.case_id            > cases.case_id
+Ref: slides.sample_id            > samples.sample_id
+Ref: slides.case_id              > cases.case_id
+
+Ref: annotations.case_id         > cases.case_id
+Ref: data_assets.dataset_id      > datasets.dataset_id
+Ref: data_assets.slide_id        > slides.slide_id
+
+// ============================================================================
+// Derived survival — a VIEW, not a table (DBML can't model views; shown for reference).
+//
+// HONEST SCOPE (verified against the COAD download):
+//   - OS (Overall Survival) — COMPUTABLE here from vital_status + days_to_death + last
+//     contact. This is the only reliable endpoint from this download.
+//   - DSS (Disease-Specific Survival) — NOT computable: there is no cause_of_death field
+//     anywhere in the download. Requires the curated TCGA-CDR table.
+//   - PFI / DFI (Progression-/Disease-Free) — technically derivable, but the recurrence/
+//     progression fields are populated in <5% of follow_ups (days_to_progression 0.4%,
+//     days_to_recurrence 3.9%) → effectively unusable. Defer to TCGA-CDR.
+// So this view exposes OS now; DSS/PFI/DFI come from an optional later TCGA-CDR download.
+//
+// IMPORTANT: join ONLY the primary diagnosis — diagnoses holds non-GI prior/synchronous
+// primaries whose stage/dates must not leak into the case's survival. (Edge case: a case
+// with a blank diagnosis_is_primary_disease flag and a single diagnosis should be treated
+// as primary — see schema_logs.md.)
+//
+//   CREATE VIEW case_survival AS  -- OS only
+//   SELECT c.case_id,
+//          c.submitter_id,
+//          c.vital_status,
+//          -- OS: time = days_to_death if dead else max last-contact; event = (dead)
+//          COALESCE(c.days_to_death,
+//                   MAX(d.days_to_last_follow_up),
+//                   MAX(f.days_to_follow_up))                       AS os_time,
+//          (c.vital_status = 'dead')::int                          AS os_event,
+//          -- PFI/DFI/DSS derived similarly from diagnoses/follow_ups recurrence+vital fields
+//          ...
+//   FROM cases c
+//   LEFT JOIN diagnoses d  ON d.case_id = c.case_id
+//                         AND d.diagnosis_is_primary_disease = true   -- primary only
+//   LEFT JOIN follow_ups f ON f.case_id = c.case_id
+//   GROUP BY c.case_id;
+// ============================================================================
+
+
+// ============================================================================
+// Removed-columns log + WATCH LIST live in docs/schema_logs.md (split out to keep this file lean).
+// ============================================================================
