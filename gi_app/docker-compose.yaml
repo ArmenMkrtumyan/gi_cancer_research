@@ -1,0 +1,157 @@
+# GI Cancer Research Platform — Phase 1 data-layer stack.
+
+# Default `docker compose up` starts the data layer: db, pgadmin, minio, minio-init,
+# etl, notebook. The web tool (api, app) lives behind the `webtool` profile and is
+# built in the next phase.
+
+# YAML anchors for reusable config (same pattern as university-app).
+x-database-env: &database-env
+  environment:
+    - DATABASE_URL=${DATABASE_URL:-postgresql://${DB_USER:-postgres}:${DB_PASSWORD:-password}@db:5432/${DB_NAME:-gi_cancer_db}}
+    - S3_ENDPOINT=${S3_ENDPOINT:-http://minio:9000}
+    - S3_ACCESS_KEY=${S3_ACCESS_KEY:-minioadmin}
+    - S3_SECRET_KEY=${S3_SECRET_KEY:-minioadmin}
+    - S3_BUCKET=${S3_BUCKET:-gi-cancer}
+    - PYTHONPATH=/shared:/etl
+
+x-db-dependency: &db-dependency
+  depends_on:
+    db:
+      condition: service_healthy
+    minio:
+      condition: service_healthy
+
+services:
+  db:
+    container_name: ${CONTAINER_NAME_DB:-gi_cancer_db}
+    image: postgres:17
+    restart: always
+    ports:
+      - 5432:5432
+    environment:
+      - POSTGRES_USER=${DB_USER:-postgres}
+      - POSTGRES_PASSWORD=${DB_PASSWORD:-password}
+      - POSTGRES_DB=${DB_NAME:-gi_cancer_db}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  pgadmin:
+    container_name: ${CONTAINER_NAME_PGADMIN:-gi_cancer_pgadmin}
+    image: dpage/pgadmin4
+    environment:
+      - PGADMIN_DEFAULT_EMAIL=${PGADMIN_EMAIL:-admin@gicancer.local}
+      - PGADMIN_DEFAULT_PASSWORD=${PGADMIN_PASSWORD:-admin}
+    ports:
+      - 5050:80
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    depends_on:
+      - db
+
+  minio:
+    container_name: ${CONTAINER_NAME_MINIO:-gi_cancer_minio}
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    restart: always
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER:-minioadmin}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - 9000:9000   # S3 API
+      - 9001:9001   # web console
+    healthcheck:
+      test: ["CMD-SHELL", "mc ready local || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    volumes:
+      - minio_data:/data
+
+  # One-shot: create the bucket + medallion prefixes, then exit 0.
+  minio-init:
+    image: minio/mc
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER:-minioadmin}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-minioadmin}
+      - S3_BUCKET=${S3_BUCKET:-gi-cancer}
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD; do echo 'waiting for minio...'; sleep 2; done;
+      mc mb -p local/$$S3_BUCKET;
+      echo keep | mc pipe local/$$S3_BUCKET/bronze/.keep;
+      echo keep | mc pipe local/$$S3_BUCKET/silver/.keep;
+      echo keep | mc pipe local/$$S3_BUCKET/gold/.keep;
+      echo 'bucket $$S3_BUCKET ready with bronze/silver/gold';
+      exit 0;
+      "
+
+  etl:
+    container_name: ${CONTAINER_NAME_ETL:-gi_cancer_etl}
+    build:
+      context: .
+      dockerfile: ./etl/Dockerfile
+    volumes:
+      - ./etl:/etl
+      - ./shared:/shared
+      - ../Data:/data:ro     # the manually-downloaded datasets (read-only)
+    <<: [*database-env, *db-dependency]
+    healthcheck:
+      test: "exit 0"
+
+  notebook:
+    container_name: ${CONTAINER_NAME_NOTEBOOK:-gi_cancer_notebook}
+    build:
+      context: .
+      dockerfile: ./notebook/Dockerfile
+    ports:
+      - 8888:8888
+    volumes:
+      - ./notebook:/notebook
+      - ./etl:/etl
+      - ./shared:/shared
+      - ../Data:/data:ro
+    <<: [*database-env, *db-dependency]
+
+  # ---- web tool (next phase) — behind a profile so default `up` skips it ----
+  api:
+    profiles: [webtool]
+    build:
+      context: .
+      dockerfile: ./api/Dockerfile
+    volumes:
+      - ./api:/api
+      - ./shared:/shared
+      - ./etl:/etl
+    ports:
+      - 8008:8000
+    <<: [*database-env, *db-dependency]
+
+  app:
+    profiles: [webtool]
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+      args:
+        - VITE_API_URL=${VITE_API_URL:-http://localhost:8008}
+    ports:
+      - 5173:80
+    depends_on:
+      - api
+
+volumes:
+  postgres_data:
+    driver: local
+  pgadmin_data:
+    driver: local
+  minio_data:
+    driver: local

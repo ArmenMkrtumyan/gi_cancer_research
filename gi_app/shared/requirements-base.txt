@@ -1,0 +1,13 @@
+# Shared base requirements installed first in every Python service image
+# (etl, notebook, and later api). Service-specific deps layer on top.
+
+# Database
+SQLAlchemy==2.0.36
+psycopg2-binary==2.9.10
+
+# Data processing
+pandas==2.2.3
+numpy==2.1.2
+
+# Utilities
+python-dotenv==1.0.1

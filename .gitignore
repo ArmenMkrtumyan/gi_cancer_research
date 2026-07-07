@@ -15,3 +15,9 @@ Data.xlsx
 __pycache__/
 *.pyc
 .venv/
+
+# Local env & service state
+gi_app/.env
+gi_app/pgadmin_data/
+gi_app/*_data/
+.ipynb_checkpoints/
