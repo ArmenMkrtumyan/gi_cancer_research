@@ -3,3 +3,10 @@ fastapi==0.121.1
 uvicorn==0.32.1
 pydantic==2.12.4
 boto3==1.35.76
+
+# WSI deep-zoom tiling. openslide-bin ships the native OpenSlide library as a wheel,
+# so no apt/system packages are needed (see docs/docker_credential_issue.md sibling
+# note on this machine's no-apt Dockerfile convention).
+Pillow==11.0.0
+openslide-python==1.4.1
+openslide-bin

@@ -372,3 +372,40 @@ class DataAsset(Base):
     size_bytes = Column(BigInteger)
     source_file_id = Column(String)  # GDC file UUID
     created_at = Column(DateTime(timezone=True))
+
+
+# ---------------------------------------------------------------------------
+# Download registry (the "Add data" tool) — the wishlist + job tracking. Kept
+# separate from `datasets` (which holds only actually-ingested datasets).
+# ---------------------------------------------------------------------------
+class DownloadCatalog(Base):
+    """A dataset someone wants to acquire: a name + a source link."""
+
+    __tablename__ = "download_catalog"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String, nullable=False)
+    source_url = Column(String, nullable=False)
+    source_type = Column(String, nullable=False)  # gdc | geo | other (detected from url)
+    gi_cancer_types = Column(String)
+    notes = Column(Text)
+    created_at = Column(DateTime(timezone=True))
+
+
+class DownloadJob(Base):
+    """One acquire+ingest job kicked off from the download tool."""
+
+    __tablename__ = "download_jobs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    catalog_id = Column(Integer, ForeignKey("download_catalog.id"), index=True)
+    project = Column(String, nullable=False)
+    dataset_name = Column(String)
+    target = Column(String, nullable=False, default="local")  # local | aws
+    status = Column(String, nullable=False, default="pending")  # pending|downloading|ingesting|done|failed
+    message = Column(Text)
+    n_slides = Column(Integer)
+    bytes_done = Column(BigInteger)
+    bytes_total = Column(BigInteger)
+    started_at = Column(DateTime(timezone=True))
+    finished_at = Column(DateTime(timezone=True))

@@ -42,11 +42,12 @@ DATASET_NAME = "TCGA-COAD"
 DATASET_FOLDER = os.environ.get("TCGA_FOLDER", "TCGA_COAD")
 COAD_PAGE = "https://portal.gdc.cancer.gov/projects/TCGA-COAD"
 
-# child -> parent delete order (respects FKs; datasets kept)
-_RESET_ORDER = [
-    "data_assets", "annotations", "aliquots", "analytes", "portions", "slides",
+# case_id-scoped child tables, child->parent delete order. data_assets + cases are cleared
+# by dataset_id separately; ingestion_runs is kept (append-only audit log).
+_RESET_CASE_SCOPED = [
+    "annotations", "aliquots", "analytes", "portions", "slides",
     "molecular_tests", "follow_ups", "pathology_details", "treatments",
-    "samples", "diagnoses", "cases", "ingestion_runs",
+    "samples", "diagnoses",
 ]
 
 
@@ -62,20 +63,27 @@ def _p(*parts):
     return os.path.join(E.DATA_ROOT, DATASET_FOLDER, *parts)
 
 
-def reset(session):
-    """Delete all rows from the ingested tables (child->parent order) for a clean reload.
+def reset(session, dataset_id):
+    """Delete THIS dataset's ingested rows (child->parent order) for a clean reload.
+
+    Scoped by dataset_id so multiple datasets coexist — re-ingesting one project must never
+    touch another's data. ingestion_runs is kept (append-only audit log).
 
     Args:
         session: The active SQLAlchemy session.
+        dataset_id: The dataset whose rows to clear.
 
     Returns:
         None.
     """
     from sqlalchemy import text
-    for table in _RESET_ORDER:
-        session.execute(text(f"DELETE FROM {table}"))
+    session.execute(text("DELETE FROM data_assets WHERE dataset_id = :d"), {"d": dataset_id})
+    case_subq = "SELECT case_id FROM cases WHERE dataset_id = :d"
+    for table in _RESET_CASE_SCOPED:
+        session.execute(text(f"DELETE FROM {table} WHERE case_id IN ({case_subq})"), {"d": dataset_id})
+    session.execute(text("DELETE FROM cases WHERE dataset_id = :d"), {"d": dataset_id})
     session.commit()
-    logger.info("Cleared existing rows for a clean reload.")
+    logger.info(f"Cleared existing rows for dataset {dataset_id} (clean reload).")
 
 
 # --------------------------------------------------------------------------- #
@@ -577,21 +585,34 @@ def load_annotations(session, cmap):
     logger.info(f"annotations: {len(rows)} loaded, {skipped} skipped (non-barcode/genomic-file)")
 
 
-def main():
-    """Run the full TCGA-COAD ingest (clinical + biospecimen + curation) and log the run.
+def main(dataset_name=DATASET_NAME, project_id="TCGA-COAD", page_url=COAD_PAGE,
+         cancer_types="Colon adenocarcinoma", folder=None, access="mixed"):
+    """Ingest a TCGA project's clinical + biospecimen + curation TSVs and log the run.
+
+    Args:
+        dataset_name: Dataset name (e.g. "TCGA-STAD"); defaults to COAD for CLI back-compat.
+        project_id: GDC project id (for logging/parity).
+        page_url: Official GDC project page URL.
+        cancer_types: Human-readable cancer type(s).
+        folder: Source folder under DATA_ROOT (defaults to env TCGA_FOLDER).
+        access: Dataset access_type enum value.
 
     Returns:
         None.
     """
+    global DATASET_FOLDER
+    if folder:
+        DATASET_FOLDER = folder
+
     session = SessionLocal()
     started = datetime.now(timezone.utc)
 
-    ds = get_or_create_dataset(session, DATASET_NAME, "mixed", COAD_PAGE, "Colon adenocarcinoma")
+    ds = get_or_create_dataset(session, dataset_name, access, page_url, cancer_types)
     session.commit()
     dataset_id = ds.dataset_id
 
     try:
-        reset(session)
+        reset(session, dataset_id)
 
         cmap = load_cases(session, dataset_id)
         dx_ids = load_diagnoses(session, cmap)
@@ -613,7 +634,7 @@ def main():
             started_at=started, finished_at=datetime.now(timezone.utc), status="success",
         ))
         session.commit()
-        logger.info(f"TCGA-COAD ingest complete (dataset_id={dataset_id}).")
+        logger.info(f"{dataset_name} ingest complete (dataset_id={dataset_id}).")
     except Exception:
         session.rollback()
         session.add(IngestionRun(

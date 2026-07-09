@@ -32,18 +32,21 @@ import sys
 import urllib.request
 import urllib.parse
 
-import openpyxl
-
 GDC_FILES = "https://api.gdc.cancer.gov/files"
 GDC_DATA = "https://api.gdc.cancer.gov/data"
 GDC_ANN = "https://api.gdc.cancer.gov/annotations"
+GDC_CASES = "https://api.gdc.cancer.gov/cases"
 SHEET = "Dataset Matrix"
+
+
+class AcquireError(Exception):
+    """Raised when acquisition can't proceed (non-GDC URL, no slides, etc.)."""
 
 
 # ----------------------------- Data.xlsx ----------------------------------- #
 def read_catalog_row(xlsx_path, row_1based):
-    """Return {name, page, source} for the Nth data row of the Dataset Matrix,
-    skipping blank separator rows."""
+    """Return {name, page} for the Nth data row of the Dataset Matrix, skipping blank rows."""
+    import openpyxl  # only the CLI xlsx path needs it (kept out of the importable library API)
     wb = openpyxl.load_workbook(xlsx_path, read_only=True, data_only=True)
     ws = wb[SHEET]
     rows = list(ws.iter_rows(values_only=True))
@@ -61,8 +64,7 @@ def read_catalog_row(xlsx_path, row_1based):
 def resolve_project(page_url):
     """Parse a GDC project_id from the Official dataset page URL."""
     if not page_url or "gdc.cancer.gov" not in page_url:
-        sys.exit(f"Row is not a GDC/TCGA dataset (page={page_url!r}); "
-                 "GEO connector handles those.")
+        raise AcquireError(f"Not a GDC/TCGA dataset (page={page_url!r}); GEO connector handles those.")
     # .../projects/TCGA-COAD  ->  TCGA-COAD
     return page_url.rstrip("/").split("/")[-1]
 
@@ -87,33 +89,28 @@ def query_slides(project, strategy):
         "format": "JSON", "size": "5000",
     }
     hits = _post(GDC_FILES, payload)["data"]["hits"]
+    stype = "diagnostic" if "Diagnostic" in strategy else "tissue"
     for h in hits:
         h["_ann"] = len(h.get("annotations") or [])
         h["_size"] = h.get("file_size", 0)
         h["_barcode"] = h["file_name"].split(".")[0]
         h["_case"] = (h.get("cases") or [{}])[0].get("submitter_id", "?")
+        h["_type"] = stype
     return hits
 
 
-def select_triple(hits, noann_bucket="middle"):
-    """Pick 3 slides: 2 with annotation + 1 without, spread by size.
-    noann_bucket controls which size slot the non-annotated file fills."""
-    withann = sorted([h for h in hits if h["_ann"]], key=lambda h: h["_size"])
-    without = sorted([h for h in hits if not h["_ann"]], key=lambda h: h["_size"])
-    if len(withann) < 2 or len(without) < 1:
-        sys.exit(f"Not enough slides to satisfy 2+1 (with={len(withann)}, without={len(without)})")
-    median = lambda xs: xs[len(xs) // 2]
-    if noann_bucket == "middle":      # annotated = small + large, non-ann = middle
-        picks = [withann[0], median(without), withann[-1]]
-    elif noann_bucket == "largest":   # annotated = small + middle, non-ann = largest
-        picks = [withann[0], median(withann), without[-1]]
-    elif noann_bucket == "smallest":  # non-ann = smallest, annotated = middle + large
-        picks = [without[0], median(withann), withann[-1]]
-    else:
-        sys.exit(f"bad noann_bucket {noann_bucket!r}")
-    for slot, h in zip(["smallest", "middle", "largest"], picks):
-        h["_slot"] = slot
-    return picks
+def select_spread(hits, n):
+    """Pick up to `n` slides spread across the size range (smallest → largest)."""
+    hits = sorted(hits, key=lambda h: h["_size"])
+    if n <= 0 or not hits:
+        return []
+    if n >= len(hits):
+        return hits
+    if n == 1:
+        return [hits[len(hits) // 2]]
+    step = (len(hits) - 1) / (n - 1)
+    idxs = sorted({round(i * step) for i in range(n)})
+    return [hits[i] for i in idxs]
 
 
 # ----------------------------- outputs ------------------------------------- #
@@ -125,60 +122,68 @@ def write_manifest(selected, path):
     open(path, "w").write("\n".join(lines) + "\n")
 
 
-def write_review_manifest(groups, path):
-    """Human-readable slide manifest (TSV). Annotation data is intentionally NOT
-    here — it lives in annotations.tsv (its own table), joined by `case`."""
-    cols = ["slide_type", "size_mb", "case", "barcode",
-            "file_name", "file_id", "md5"]
+def write_review_manifest(selected, path):
+    """Human-readable slide manifest (TSV) from a flat selected list. Annotation data is
+    intentionally NOT here — it lives in annotations.tsv (its own table), joined by `case`."""
+    cols = ["slide_type", "size_mb", "case", "barcode", "file_name", "file_id", "md5"]
     lines = ["\t".join(cols)]
-    for strategy, picks in groups.items():
-        stype = "diagnostic" if "Diagnostic" in strategy else "tissue"
-        for h in picks:
-            lines.append("\t".join([
-                stype, f"{h['_size']/1e6:.1f}",
-                h["_case"], h["_barcode"], h["file_name"], h["file_id"],
-                h.get("md5sum", ""),
-            ]))
+    for h in selected:
+        lines.append("\t".join([
+            h["_type"], f"{h['_size']/1e6:.1f}", h["_case"], h["_barcode"],
+            h["file_name"], h["file_id"], h.get("md5sum", ""),
+        ]))
     open(path, "w").write("\n".join(lines) + "\n")
 
 
-def print_report(project, groups, review_path):
-    print(f"\n{'='*90}\n  SELECTION PLAN — {project}\n{'='*90}")
-    for strategy, picks in groups.items():
-        print(f"\n  {strategy}:")
-        print(f"    {'slot':9} {'ann*':5} {'size':>9}  {'case':14} file")
-        for h in picks:
-            print(f"    {h['_slot']:9} {('yes' if h['_ann'] else 'no'):5} "
-                  f"{h['_size']/1e6:7.1f}MB  {h['_case']:14} {h['file_name'][:44]}")
-    total = sum(h["_size"] for picks in groups.values() for h in picks)
-    n = sum(len(p) for p in groups.values())
-    print(f"\n  * 'ann' = selection used GDC annotation presence (2 with + 1 without per type).")
-    print(f"    The annotation DATA lives in annotations.tsv (its own table), joined by `case`.")
+def print_report(project, selected, review_path):
+    total = sum(h["_size"] for h in selected)
+    print(f"\n{'='*80}\n  PLAN — {project}: {len(selected)} slides, {total/1e9:.2f} GB\n{'='*80}")
+    for h in selected:
+        print(f"    {h['_type']:11} {h['_size']/1e6:7.1f}MB  {h['_case']:14} {h['file_name'][:44]}")
     print(f"  + normalized clinical/ + biospecimen/ + annotations.tsv (fetched on download)")
-    print(f"  slide total: {total/1e9:.2f} GB across {n} files")
-    print(f"  manifest:  {review_path}  (slide files only — no annotation columns)")
+    print(f"  manifest:  {review_path}")
     print(f"\n  Review the files above. To download, re-run with --download\n")
 
 
 # ----------------------------- download ------------------------------------ #
-def download_selected(selected, outdir):
+def download_selected(selected, outdir, on_progress=None):
+    """Download the selected slides (md5-verified).
+
+    Args:
+        selected: The chosen slide hits.
+        outdir: Destination directory.
+        on_progress: Optional callback(slide_index, total_slides, done_bytes, total_bytes),
+            invoked as bytes arrive (throttled) so callers can report live progress.
+    """
     import hashlib
     os.makedirs(outdir, exist_ok=True)
+    total = len(selected)
+    total_bytes = sum(h["_size"] for h in selected)
+    done_bytes = 0
     for i, h in enumerate(selected, 1):
         dest = os.path.join(outdir, h["file_name"])
         if os.path.exists(dest) and os.path.getsize(dest) == h["_size"]:
-            print(f"  [{i}/{len(selected)}] exists, skipping {h['file_name']}")
+            print(f"  [{i}/{total}] exists, skipping {h['file_name']}")
+            done_bytes += h["_size"]
+            if on_progress:
+                on_progress(i, total, done_bytes, total_bytes)
             continue
-        print(f"  [{i}/{len(selected)}] {h['file_name']} ({h['_size']/1e6:.0f} MB)...", flush=True)
+        print(f"  [{i}/{total}] {h['file_name']} ({h['_size']/1e6:.0f} MB)...", flush=True)
         m = hashlib.md5()
+        since = 0
         with urllib.request.urlopen(f"{GDC_DATA}/{h['file_id']}", timeout=300) as r, open(dest, "wb") as o:
             while True:
                 c = r.read(1 << 20)
                 if not c:
                     break
                 o.write(c); m.update(c)
+                done_bytes += len(c); since += len(c)
+                if on_progress and since >= (256 << 20):  # report every ~256 MB
+                    on_progress(i, total, done_bytes, total_bytes); since = 0
         if h.get("md5sum") and m.hexdigest() != h["md5sum"]:
             print(f"      !! md5 MISMATCH for {h['file_name']}", file=sys.stderr)
+        if on_progress:
+            on_progress(i, total, done_bytes, total_bytes)
 
 
 def fetch_annotations(project, outdir):
@@ -277,41 +282,83 @@ def fetch_clinical_biospecimen(project, outdir):
         print(f"  wrote {relpath}.tsv ({len(rows)} rows)")
 
 
+# ----------------------------- library API --------------------------------- #
+def count_cases(project):
+    """Total number of cases (patients) GDC has for a project."""
+    filt = json.dumps({"op": "in", "content": {"field": "project.project_id", "value": [project]}})
+    params = urllib.parse.urlencode({"filters": filt, "format": "JSON", "size": "0"})
+    with urllib.request.urlopen(f"{GDC_CASES}?{params}", timeout=60) as r:
+        return json.loads(r.read())["data"]["pagination"]["total"]
+
+
+def plan(project, dest, limit=6):
+    """Select the project's slides and write slides_manifest.tsv to `dest`. No download.
+
+    Args:
+        limit: total slides to sample across diagnostic + tissue (split roughly evenly,
+            spread by size). 0 or None => ALL slides (a full download).
+
+    Returns:
+        (selected, manifest_path). Raises AcquireError if no slides are available.
+    """
+    diag = query_slides(project, "Diagnostic Slide")
+    tiss = query_slides(project, "Tissue Slide")
+    if not limit:  # full download — every open tumor slide
+        selected = diag + tiss
+    else:
+        n_diag = (limit + 1) // 2  # odd remainder goes to diagnostic (the pathology-AI ones)
+        selected = select_spread(diag, n_diag) + select_spread(tiss, limit - n_diag)
+    if not selected:
+        raise AcquireError(f"No open-access tumor slides found for {project}.")
+    os.makedirs(dest, exist_ok=True)
+    manifest = os.path.join(dest, "slides_manifest.tsv")
+    write_review_manifest(selected, manifest)
+    return selected, manifest
+
+
+def download(project, dest, selected=None, limit=6, on_progress=None):
+    """Download the selected slides + clinical/biospecimen + annotations into `dest`.
+
+    Args:
+        selected: pre-selected slides; if None, `plan(project, dest, limit)` chooses them.
+        limit: sample size when `selected` is None (0/None = all).
+        on_progress: Optional callback(i, total, done_bytes, total_bytes) for the slide phase.
+    """
+    if selected is None:
+        selected, _ = plan(project, dest, limit)
+    download_selected(selected, os.path.join(dest, "slides"), on_progress=on_progress)
+    fetch_clinical_biospecimen(project, dest)
+    fetch_annotations(project, dest)
+
+
 # ------------------------------- main -------------------------------------- #
 def main():
     p = argparse.ArgumentParser(description="Catalog-driven GDC acquisition (plan -> review -> download).")
     p.add_argument("--xlsx", default="../../../Data/Data.xlsx")
     p.add_argument("--row", type=int, default=1, help="1-based data row of Dataset Matrix")
+    p.add_argument("--project", default=None, help="GDC project id directly (bypass xlsx), e.g. TCGA-STAD")
+    p.add_argument("--name", default=None, help="dataset name (used with --project)")
     p.add_argument("--out", default="../../../Data", help="root data folder")
     p.add_argument("--dest", default=None, help="override dataset folder (default: <out>/<project>)")
-    p.add_argument("--noann-bucket", choices=["smallest", "middle", "largest"], default="middle",
-                   help="which size slot the non-annotated slide fills")
+    p.add_argument("--limit", type=int, default=6, help="total slides to sample (0 = all / full)")
     p.add_argument("--plan", action="store_true", help="select + write manifest only (no download)")
     p.add_argument("--download", action="store_true", help="download the selected files")
     args = p.parse_args()
 
-    row = read_catalog_row(args.xlsx, args.row)
-    project = resolve_project(row["page"])
-    print(f"Row {args.row}: {row['name']}  ->  GDC project {project}")
+    if args.project:
+        project, name = args.project, (args.name or args.project)
+    else:
+        row = read_catalog_row(args.xlsx, args.row)
+        project, name = resolve_project(row["page"]), row["name"]
+    print(f"{name}  ->  GDC project {project}")
 
-    groups = {}
-    for strategy in ("Diagnostic Slide", "Tissue Slide"):
-        groups[strategy] = select_triple(query_slides(project, strategy), args.noann_bucket)
-
-    selected = [h for picks in groups.values() for h in picks]
     proj_dir = args.dest or os.path.join(args.out, project)
-    os.makedirs(proj_dir, exist_ok=True)
-    review_manifest = os.path.join(proj_dir, "slides_manifest.tsv")
-    write_review_manifest(groups, review_manifest)
-    print_report(project, groups, review_manifest)
+    selected, manifest = plan(project, proj_dir, args.limit)
+    print_report(project, selected, manifest)
 
     if args.download:
-        print("Downloading slides...")
-        download_selected(selected, os.path.join(proj_dir, "slides"))
-        print("Fetching clinical + biospecimen TSVs...")
-        fetch_clinical_biospecimen(project, proj_dir)
-        print("Fetching annotations...")
-        fetch_annotations(project, proj_dir)
+        print("Downloading slides + clinical/biospecimen + annotations...")
+        download(project, proj_dir, selected)
         print("Done.")
 
 

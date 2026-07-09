@@ -105,8 +105,7 @@ exposes, and how they depend on each other.
     shows as **Exited (0)** — it runs once and stops).
   - **`etl`**
   - **`notebook`**
-  - **`api` / `app`** — have `profiles: [webtool]`, so a plain `docker compose up`
-    **skips them**. They start only when that profile is enabled.
+  - **`api` / `app`** — start with the rest of the stack and power the local dashboard.
 - **`volumes:`**
   - `postgres_data`
   - `pgadmin_data`
@@ -218,9 +217,13 @@ the `*_ingest.py` files *load* it. Separate concerns.
 - **`notebook/`** — Jupyter Dockerfile + requirements (jupyterlab, matplotlib, duckdb,
   pyarrow) + `starter.ipynb` that connects to the DB and shows `dataset_stats`. The
   analysis playground.
-- **`api/main.py`** — a minimal FastAPI app with `/health` and `/datasets`; the seed for
-  the web-tool phase, behind the `webtool` profile so it doesn't run yet.
-- **`app/`** — placeholder for the React frontend, also behind the profile.
+- **`api/main.py`** — FastAPI backend for the first ingested-data dashboard. It exposes
+  `/health`, `/datasets`, `/stats/overview`,
+  `/stats/dataset-stats`, dataset summary/survival/missingness/linkage endpoints,
+  asset endpoints, signed download URLs, and ingestion runs.
+- **`app/`** — static nginx-served dashboard for already-ingested data. It shows the
+  `dataset_stats` and `case_survival` views, metadata completeness, linkage checks,
+  downloaded WSI assets, and ETL runs.
 
 ---
 
@@ -237,6 +240,24 @@ docker compose down                           # stop (data is kept)
 
 - Add `--build` after changing a Dockerfile or requirements file (not needed for `.py` edits).
 - `docker compose down -v` also deletes the data volumes — a completely fresh start.
+
+### Docker Desktop credential-helper note
+
+If Docker fails while pulling/building with:
+
+```text
+exec: "docker-credential-desktop": executable file not found in $PATH
+```
+
+Docker Desktop's credential helper exists, but your shell cannot find it. For the current
+terminal session, run:
+
+```bash
+export PATH="/Applications/Docker.app/Contents/Resources/bin:$PATH"
+```
+
+Then rerun `docker compose up -d --build`. Add the same export to `~/.zshrc` if you want
+it to persist for future terminals.
 
 ---
 
@@ -304,3 +325,14 @@ from `.env`. Go to **Object Browser → `gi-cancer` → `bronze/TCGA-COAD/slides
 uploaded `.svs` slide images.
 
 Jupyter (notebook service): http://localhost:8888.
+
+### Opening the web dashboard
+
+Start the stack, then open:
+
+- API docs: http://localhost:8008/docs
+- Dashboard: http://localhost:5173
+
+The dashboard asks the API for signed MinIO links when you click a WSI asset. Locally,
+the API rewrites those signed links to `S3_PUBLIC_ENDPOINT` (default
+`http://localhost:9000`) so they work from your browser.

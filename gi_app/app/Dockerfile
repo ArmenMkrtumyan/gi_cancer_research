@@ -1,5 +1,24 @@
-# Placeholder — replaced with the real multi-stage Vite build (node -> nginx) in the
-# web-tool phase. Present so the compose `webtool` profile resolves.
+FROM node:18-alpine AS build
+
+WORKDIR /app
+
+ARG VITE_API_URL=http://localhost:8008
+ENV VITE_API_URL=$VITE_API_URL
+
+COPY package*.json ./
+
+RUN npm install
+
+COPY . .
+
+RUN npm run build
+
 FROM nginx:alpine
-RUN echo '<h1>GI Cancer web tool — coming in the web-tool phase</h1>' > /usr/share/nginx/html/index.html
+
+COPY --from=build /app/dist /usr/share/nginx/html
+
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+
 EXPOSE 80
+
+CMD ["nginx", "-g", "daemon off;"]

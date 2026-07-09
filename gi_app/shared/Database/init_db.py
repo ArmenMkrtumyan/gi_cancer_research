@@ -43,8 +43,48 @@ GROUP BY c.case_id, c.submitter_id, c.vital_status, c.days_to_death;
 """
 
 
+# The 7 TCGA GI-cancer projects (Data.xlsx rows 1-7). Seeded into the download registry so
+# the "Add data" page is useful on day one. GEO rows are deferred (no connector yet).
+SEED_CATALOG = [
+    ("TCGA-COAD", "Colon adenocarcinoma"),
+    ("TCGA-READ", "Rectal adenocarcinoma"),
+    ("TCGA-STAD", "Gastric adenocarcinoma"),
+    ("TCGA-ESCA", "Esophageal carcinoma"),
+    ("TCGA-PAAD", "Pancreatic ductal adenocarcinoma"),
+    ("TCGA-LIHC", "Liver hepatocellular carcinoma"),
+    ("TCGA-CHOL", "Cholangiocarcinoma"),
+]
+
+
+def seed_download_catalog():
+    """Seed the 7 TCGA projects into download_catalog (idempotent, keyed by source_url)."""
+    from datetime import datetime, timezone
+
+    from Database.database import SessionLocal
+    from Database.models import DownloadCatalog
+
+    session = SessionLocal()
+    try:
+        existing = {r[0] for r in session.query(DownloadCatalog.source_url).all()}
+        added = 0
+        for project, cancer in SEED_CATALOG:
+            url = f"https://portal.gdc.cancer.gov/projects/{project}"
+            if url in existing:
+                continue
+            session.add(DownloadCatalog(
+                name=project, source_url=url, source_type="gdc",
+                gi_cancer_types=cancer, created_at=datetime.now(timezone.utc),
+            ))
+            added += 1
+        session.commit()
+        if added:
+            logger.info(f"Seeded {added} TCGA projects into download_catalog.")
+    finally:
+        session.close()
+
+
 def init_db():
-    """Create all tables (if missing) and (re)create the derived views. Idempotent.
+    """Create all tables (if missing), (re)create the derived views, seed the catalog. Idempotent.
 
     Returns:
         None.
@@ -55,6 +95,7 @@ def init_db():
     with engine.begin() as conn:
         conn.execute(text(DATASET_STATS_VIEW))
         conn.execute(text(CASE_SURVIVAL_VIEW))
+    seed_download_catalog()
     logger.info("Database initialized.")
 
 

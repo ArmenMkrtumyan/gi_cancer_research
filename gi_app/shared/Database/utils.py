@@ -6,6 +6,23 @@ Kept next to the models since these operate directly on the database.
 from Database.models import Dataset
 
 
+def detect_source_type(url):
+    """Classify a source URL so the download tool knows which connector (if any) fits.
+
+    Args:
+        url: The dataset's source link.
+
+    Returns:
+        "gdc" (portal.gdc.cancer.gov), "geo" (NCBI GEO), or "other".
+    """
+    u = (url or "").lower()
+    if "gdc.cancer.gov" in u:
+        return "gdc"
+    if "ncbi.nlm.nih.gov/geo" in u or "/geo/" in u:
+        return "geo"
+    return "other"
+
+
 def get_or_create_dataset(session, name, access_type, official_page=None, gi_cancer_types=None):
     """Insert or update a dataset row, keyed by name (idempotent).
 

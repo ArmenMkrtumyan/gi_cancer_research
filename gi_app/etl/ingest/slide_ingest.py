@@ -20,17 +20,26 @@ DATASET_NAME = "TCGA-COAD"
 DATASET_FOLDER = os.environ.get("TCGA_FOLDER", "TCGA_COAD")
 
 
-def main():
+def main(dataset_name=DATASET_NAME, project_id="TCGA-COAD", folder=None, target="local"):
     """Upload the sampled .svs slides to object storage and register them in data_assets.
+
+    Args:
+        dataset_name: The ingested dataset to attach the assets to.
+        project_id: GDC project id; used as the bronze URI path segment.
+        folder: Source folder under DATA_ROOT (defaults to env TCGA_FOLDER).
+        target: Storage target ("local" MinIO | "aws" S3).
 
     Returns:
         None.
     """
+    global DATASET_FOLDER
+    if folder:
+        DATASET_FOLDER = folder
     session = SessionLocal()
     try:
-        ds = session.query(Dataset).filter_by(name=DATASET_NAME).one_or_none()
+        ds = session.query(Dataset).filter_by(name=dataset_name).one_or_none()
         if ds is None:
-            logger.error(f"Dataset {DATASET_NAME} not found — run tcga_ingest first.")
+            logger.error(f"Dataset {dataset_name} not found — run tcga_ingest first.")
             return
         dataset_id = ds.dataset_id
 
@@ -59,8 +68,8 @@ def main():
                 missing.append(fname)
                 continue
 
-            uri = storage.build_uri("bronze", "TCGA-COAD", "slides", fname)
-            storage.put_file(local, uri)
+            uri = storage.build_uri("bronze", project_id, "slides", fname, target=target)
+            storage.put_file(local, uri, target=target)
             n_up += 1
 
             slide_id = smap.get(barcode)
