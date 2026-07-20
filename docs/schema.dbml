@@ -93,8 +93,40 @@ Enum section_location {
 }
 
 // data_assets (file pointers)
-Enum asset_type {
-  wsi                                  // whole-slide image (.svs); add types as onboarded
+//
+// NOTE: asset_type is NO LONGER a Postgres enum — it became varchar + CHECK in migration
+// 001. New asset types arrive whenever an annotation source is onboarded, and
+// `ALTER TYPE ... ADD VALUE` cannot be used in the same transaction that inserts the new
+// value, which makes an enum a poor fit for a migration-driven workflow. Kept here as the
+// documented vocabulary; same reasoning as the clinical varchar vocabularies.
+Enum asset_type {                      // DOCUMENTATION ONLY — implemented as varchar + CHECK
+  wsi                                  // whole-slide image (.svs)
+  annotation_source                    // published annotation file, preserved byte-for-byte
+  annotation_mask                      // raster mask
+  annotation_vector                    // polygons / points
+  rendering_cache                      // browser-renderable derivative of a source annotation
+}
+
+// annotation_sets / annotations — open vocabularies, varchar + CHECK (never enums).
+Enum annotation_origin {                // DOCUMENTATION ONLY
+  source_provided                       // shipped with the source dataset (e.g. GDC)
+  published_derived                     // a published derived dataset (e.g. TCGA-SBU-TIL-Maps)
+}
+
+Enum annotation_method {                // DOCUMENTATION ONLY
+  manual
+  algorithmic
+  mixed
+  not_reported
+}
+
+Enum annotation_scope {                 // DOCUMENTATION ONLY
+  case                                  // about the patient/entity; non-spatial
+  slide                                 // about a whole slide; non-spatial
+  region                                // spatial - requires target_asset_id
+  patch                                 // spatial - requires target_asset_id
+  tile                                  // spatial - requires target_asset_id
+  nucleus                               // spatial - requires target_asset_id
 }
 
 Enum asset_layer {
@@ -475,27 +507,106 @@ Table slides {
 // copy_number_*, structural_variation) carry a FILE UUID, not a barcode — no case is
 // derivable and the referenced files are out of scope — so they are SKIPPED (raw
 // annotations.tsv kept on disk for audit).
-Table annotations {
-  annotation_id           uuid                   [primary key]
-  entity_type             varchar                [note: 'what the annotation is about; only barcode-based types are loaded (see table note); varchar']
-  entity_submitter_id     varchar                [not null, note: 'the entity barcode (raw polymorphic ref); barcode for loaded rows']
-  case_id                 uuid                   [note: 'FK; ETL-resolved from the entity_submitter_id barcode prefix (always set for loaded rows)']
-  category                varchar                [note: 'QC reason + main filter: Item flagged DNU / Prior malignancy / ... (16 values, some long)']
-  classification          varchar                [note: 'Notification / Redaction / CenterNotification / Observation; varchar']
-  notes                   text                   [note: 'free-text detail']
-  created_datetime        timestamp              [note: 'kept for provenance']
+// SUPERSEDED (migration 001, 2026-07-20): the reserved `slide_labels` table below was
+// retired and `annotations` was GENERALIZED to hold both GDC admin/QC notes and published
+// spatial annotations. Rationale in docs/schema_logs.md ("Annotation generalization").
+// In short: both kinds need the same provenance chain, and one table means one API and one
+// provenance path rather than two parallel ones. Semantic separation is carried by
+// `origin` + `scope` + `annotation_type`, not by table identity.
+
+// One row per imported annotation collection/release. Collection-level provenance
+// (provider, licence, citation, method) is stored here ONCE instead of on every row.
+Table annotation_sets {
+  annotation_set_id       integer                [primary key]
+  dataset_id              integer                [not null, note: 'FK -> datasets; one set per collection release PER local dataset']
+  name                    varchar                [not null, note: 'e.g. "GDC Annotations — TCGA-COAD", "TCGA-SBU-TIL-Maps"']
+  provider                varchar                [note: 'who produced it: GDC, Stony Brook via IDC, ...']
+  source_url              varchar                [note: 'DOI / landing page']
+  citation                text                   [note: 'required attribution']
+  license                 varchar                [note: 'e.g. CC BY 4.0']
+  version                 varchar                [not null, note: 'release id; part of the uniqueness key so re-imports are idempotent']
+  method                  varchar                [note: 'manual | algorithmic | mixed | not_reported (CHECK, not enum)']
+  origin                  varchar                [not null, note: 'source_provided | published_derived (CHECK, not enum)']
+  description             text
+  retrieved_at            timestamp
+  created_at              timestamp
 
   indexes {
-    entity_submitter_id
-    case_id
+    dataset_id
+    (dataset_id, name, version) [unique]
   }
 }
 
-// RESERVED (Phase 2, not built now): a future `slide_labels` table for real
-// pathology-AI labels on slides — region masks, cell/nuclei annotations,
-// slide-level prognostic labels (see plan.txt Phase 2). Those are TRAINING labels
-// and get their OWN table; do NOT overload `annotations` (which is GDC admin/QC
-// notes only). Will FK to `slides` (and/or the .svs data_asset).
+// One row per logical annotation — administrative (GDC QC note) or spatial (published
+// overlay). GDC rows keep their original UUID in source_annotation_id and their entity
+// type/barcode in the source_* columns; nothing from the old shape was dropped.
+//
+// ETL LOADS ONLY barcode-resolvable GDC entity types (case / aliquot / portion / analyte
+// ≈ 1106 rows for COAD) and resolves case_id from the barcode prefix. The ~2439
+// genomic-file rows carry a FILE UUID, not a barcode — no case is derivable — so they are
+// SKIPPED (raw annotations.tsv kept on disk for audit).
+//
+// DELIBERATE DENORMALIZATION: `case_id` is redundant for spatial rows (derivable via
+// target_asset -> slides -> cases). Kept because every read path filters by case; the ETL
+// invariant is that it always equals the target asset's case, restored after each reload
+// by relink_published_annotations().
+Table annotations {
+  annotation_id             integer              [primary key, note: 'internal surrogate; NOT the source id']
+  annotation_set_id         integer              [not null, note: 'FK -> annotation_sets; provenance is mandatory']
+  source_annotation_id      varchar              [not null, note: 'the source identifier: GDC annotation UUID / IDC SeriesInstanceUID']
+  case_id                   uuid                 [note: 'FK -> cases; nullable (a slide-only annotation need not name a case)']
+  target_asset_id           integer              [note: 'FK -> data_assets; the EXACT WSI a spatial annotation sits on']
+  scope                     varchar              [not null, note: 'case | slide | region | patch | tile | nucleus (CHECK)']
+  annotation_type           varchar              [note: 'qc | TIL | nuclei | tumor | necrosis | ...']
+  label                     varchar
+  category                  varchar              [note: 'GDC QC reason: Item flagged DNU / Prior malignancy / ...']
+  classification            varchar              [note: 'Notification / Redaction / CenterNotification / Observation']
+  value_text                text
+  value_number              float
+  units                     varchar
+  confidence                float
+  review_status             varchar              [note: 'never "pathologist_reviewed" unless the SOURCE says so']
+  source_entity_type        varchar              [note: 'preserved GDC entity_type']
+  source_entity_submitter_id varchar             [note: 'preserved GDC entity barcode']
+  notes                     text
+  source_created_datetime   timestamp
+  source_updated_datetime   timestamp
+  created_at                timestamp
+
+  indexes {
+    annotation_set_id
+    case_id
+    target_asset_id
+    source_entity_submitter_id
+    (annotation_set_id, scope)
+    (annotation_set_id, source_annotation_id) [unique]
+  }
+}
+
+// One row per stored representation of a spatial annotation. Large masks and vector
+// geometry NEVER live in Postgres — asset_id points at the file in object storage.
+// No PostGIS: the first sources are raster grids and file-backed vectors, so it would add
+// an extension dependency without buying anything yet.
+Table annotation_representations {
+  representation_id       integer                [primary key]
+  annotation_id           integer                [not null, note: 'FK -> annotations']
+  asset_id                integer                [not null, note: 'FK -> data_assets; the stored file']
+  representation_type     varchar                [note: 'binary_mask | probability_map | polygon | points | rendering_derivative']
+  coordinate_space        varchar                [note: 'level_0_pixels | DICOM_slide_coordinates']
+  width                   integer                [note: 'representation grid width (NOT the slide width)']
+  height                  integer
+  level                   integer                [note: 'slide level the coordinates refer to (0 = full resolution)']
+  transform_metadata      jsonb                  [note: 'scale + offset placing the grid on level 0; the viewer uses these numbers rather than stretching to fit']
+  minimum_value           float
+  maximum_value           float
+  created_at              timestamp
+
+  indexes {
+    annotation_id
+    asset_id
+    (annotation_id, asset_id) [unique]
+  }
+}
 
 // ============================================================================
 // File pointers → object storage (Group A binaries live as files, not in DB)
@@ -507,18 +618,21 @@ Table data_assets {
   asset_id                integer      [primary key]
   dataset_id              integer      [not null, note: 'FK -> datasets; one of only two places dataset_id lives']
   slide_id                uuid         [note: 'nullable FK -> slides; set for asset_type=wsi']
-  asset_type              asset_type   [note: 'wsi now; grows as new big-file types are onboarded']
+  asset_type              varchar      [note: 'varchar + CHECK (see asset_type vocabulary above): wsi | annotation_source | annotation_mask | annotation_vector | rendering_cache']
   layer                   asset_layer  [note: 'medallion layer; raw .svs = bronze']
   uri                     varchar      [not null, note: 's3://gi-cancer/bronze/TCGA-COAD/slides/<file>.svs']
-  format                  varchar      [note: 'svs, parquet, ...']
+  format                  varchar      [note: 'svs, parquet, dcm, png, ...']
   md5                     varchar      [note: 'integrity checksum (verified on download)']
   size_bytes              bigint       [note: 'file size']
-  source_file_id          varchar      [note: 'GDC file UUID; provenance / re-download']
+  source_file_id          varchar      [note: 'GDC file UUID / IDC crdc_series_uuid; provenance / re-download']
+  source_uri              varchar      [note: 'where it was fetched from (external provenance), e.g. s3://idc-open-data/<uuid>/']
+  derived_from_asset_id   integer      [note: 'nullable self-FK; set on a rendering derivative to point at the ORIGINAL published file, which is never overwritten']
   created_at              timestamp
 
   indexes {
     dataset_id
     slide_id
+    derived_from_asset_id
   }
 }
 
@@ -546,9 +660,16 @@ Ref: aliquots.case_id            > cases.case_id
 Ref: slides.sample_id            > samples.sample_id
 Ref: slides.case_id              > cases.case_id
 
+Ref: annotation_sets.dataset_id  > datasets.dataset_id
+Ref: annotations.annotation_set_id > annotation_sets.annotation_set_id
 Ref: annotations.case_id         > cases.case_id
+Ref: annotations.target_asset_id > data_assets.asset_id
+Ref: annotation_representations.annotation_id > annotations.annotation_id
+Ref: annotation_representations.asset_id      > data_assets.asset_id
+
 Ref: data_assets.dataset_id      > datasets.dataset_id
 Ref: data_assets.slide_id        > slides.slide_id
+Ref: data_assets.derived_from_asset_id > data_assets.asset_id
 
 // ============================================================================
 // Derived survival — a VIEW, not a table (DBML can't model views; shown for reference).
@@ -584,6 +705,35 @@ Ref: data_assets.slide_id        > slides.slide_id
 //                         AND d.diagnosis_is_primary_disease = true   -- primary only
 //   LEFT JOIN follow_ups f ON f.case_id = c.case_id
 //   GROUP BY c.case_id;
+// ============================================================================
+
+
+// ============================================================================
+// Patient clinical timeline — a VIEW (case_timeline), not a table. Definition in
+// shared/Database/init_db.py.
+//
+// Deliberately NOT a persistent event table: the clinical records already live in
+// diagnoses/treatments/samples/follow_ups/molecular_tests/slides, and copying them into an
+// event store would create a second source of truth that can drift from the first.
+//
+// TIMING HONESTY (the whole point of the view):
+//   * `day` is days relative to the initial pathologic diagnosis — the unit TCGA records.
+//     There are NO absolute calendar dates in this download. A source NULL stays NULL.
+//   * `timing_basis` says where the timing came from, so the UI can distinguish:
+//       baseline              — diagnosis, day 0 by definition
+//       relative_to_diagnosis — an exact days_to_* value from the source
+//       derived_from_specimen — a slide event inheriting its sample's collection day
+//       unknown               — the source records no clinical date
+//   * `created_datetime` is a GDC record-keeping timestamp, NOT a clinical event date, and
+//     is never used as one. molecular_tests has no clinical date column at all, so every
+//     molecular event is timing_basis='unknown' rather than being given a fabricated day.
+//   * slide_available events carry asset_id so the UI can open the WSI viewer.
+//
+//   CREATE VIEW case_timeline AS
+//     SELECT case_id, event_type, day, timing_basis, label, detail,
+//            ref_table, ref_id, asset_id
+//     FROM (... UNION ALL over diagnoses / samples / treatments / follow_ups /
+//               molecular_tests / slides+data_assets / cases ...);
 // ============================================================================
 
 

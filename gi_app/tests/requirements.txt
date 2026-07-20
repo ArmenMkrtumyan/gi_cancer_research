@@ -1,0 +1,5 @@
+# Test-only dependencies. Installed into the api container to run the suite:
+#   docker exec gi_app-api-1 pip install -r /tests/requirements.txt
+#   docker exec gi_app-api-1 python -m pytest /tests -q
+pytest==8.3.4
+httpx==0.28.1

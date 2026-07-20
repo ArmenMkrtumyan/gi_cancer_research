@@ -152,24 +152,28 @@ def download_selected(selected, outdir, on_progress=None):
     Args:
         selected: The chosen slide hits.
         outdir: Destination directory.
-        on_progress: Optional callback(slide_index, total_slides, done_bytes, total_bytes),
-            invoked as bytes arrive (throttled) so callers can report live progress.
+        on_progress: Optional callback(slide_index, total_slides, hit, file_done, file_size)
+            reporting progress for the CURRENT file (hit is that slide's dict; file_done /
+            file_size are its own bytes, not an aggregate). Fired at each file's start
+            (file_done=0), throttled while it streams, and on completion — so callers can
+            show exactly which file is downloading and how far along it is.
     """
     import hashlib
     os.makedirs(outdir, exist_ok=True)
     total = len(selected)
-    total_bytes = sum(h["_size"] for h in selected)
-    done_bytes = 0
     for i, h in enumerate(selected, 1):
+        file_size = h["_size"]
         dest = os.path.join(outdir, h["file_name"])
-        if os.path.exists(dest) and os.path.getsize(dest) == h["_size"]:
+        if os.path.exists(dest) and os.path.getsize(dest) == file_size:
             print(f"  [{i}/{total}] exists, skipping {h['file_name']}")
-            done_bytes += h["_size"]
             if on_progress:
-                on_progress(i, total, done_bytes, total_bytes)
+                on_progress(i, total, h, file_size, file_size)
             continue
-        print(f"  [{i}/{total}] {h['file_name']} ({h['_size']/1e6:.0f} MB)...", flush=True)
+        print(f"  [{i}/{total}] {h['file_name']} ({file_size/1e6:.0f} MB)...", flush=True)
+        if on_progress:
+            on_progress(i, total, h, 0, file_size)  # announce this file at 0%
         m = hashlib.md5()
+        file_done = 0
         since = 0
         with urllib.request.urlopen(f"{GDC_DATA}/{h['file_id']}", timeout=300) as r, open(dest, "wb") as o:
             while True:
@@ -177,13 +181,13 @@ def download_selected(selected, outdir, on_progress=None):
                 if not c:
                     break
                 o.write(c); m.update(c)
-                done_bytes += len(c); since += len(c)
-                if on_progress and since >= (256 << 20):  # report every ~256 MB
-                    on_progress(i, total, done_bytes, total_bytes); since = 0
+                file_done += len(c); since += len(c)
+                if on_progress and since >= (64 << 20):  # report every ~64 MB
+                    on_progress(i, total, h, file_done, file_size); since = 0
         if h.get("md5sum") and m.hexdigest() != h["md5sum"]:
             print(f"      !! md5 MISMATCH for {h['file_name']}", file=sys.stderr)
         if on_progress:
-            on_progress(i, total, done_bytes, total_bytes)
+            on_progress(i, total, h, file_size, file_size)  # this file complete
 
 
 def fetch_annotations(project, outdir):
@@ -291,6 +295,62 @@ def count_cases(project):
         return json.loads(r.read())["data"]["pagination"]["total"]
 
 
+def access_breakdown(project):
+    """How much of a GDC project is publicly downloadable vs controlled-access.
+
+    Every GDC file is either 'open' (anyone can download) or 'controlled' (needs dbGaP/NIH
+    authorization — raw sequencing reads, germline/somatic variants, etc.). This reads only the
+    public file *metadata* (available even for controlled files), so it reports what exists behind
+    controlled access without needing authorization. Scans all files once (paged) to get exact
+    counts AND byte volume, split by access and by data_category.
+
+    Returns:
+        dict: {available, project, total_files, open:{files,bytes}, controlled:{files,bytes},
+               by_category:[{category, open_files, open_bytes, controlled_files, controlled_bytes}]}.
+    """
+    from collections import defaultdict
+    filt = json.dumps({"op": "in", "content": {"field": "cases.project.project_id", "value": [project]}})
+    totals = {"open": [0, 0], "controlled": [0, 0]}  # [files, bytes]
+    cats = defaultdict(lambda: {"open": [0, 0], "controlled": [0, 0]})
+    offset, page = 0, 10000
+    while True:
+        params = urllib.parse.urlencode({
+            "filters": filt, "fields": "file_size,access,data_category",
+            "format": "JSON", "size": str(page), "from": str(offset),
+        })
+        with urllib.request.urlopen(f"{GDC_FILES}?{params}", timeout=180) as r:
+            data = json.loads(r.read())["data"]
+        hits = data["hits"]
+        for h in hits:
+            acc = h.get("access")
+            if acc not in totals:
+                continue
+            size = h.get("file_size") or 0
+            cat = h.get("data_category") or "Unknown"
+            totals[acc][0] += 1
+            totals[acc][1] += size
+            cats[cat][acc][0] += 1
+            cats[cat][acc][1] += size
+        offset += len(hits)
+        if not hits or offset >= data["pagination"]["total"]:
+            break
+    by_category = sorted(
+        ({"category": c,
+          "open_files": v["open"][0], "open_bytes": v["open"][1],
+          "controlled_files": v["controlled"][0], "controlled_bytes": v["controlled"][1]}
+         for c, v in cats.items()),
+        key=lambda x: -(x["open_files"] + x["controlled_files"]),
+    )
+    return {
+        "available": True,
+        "project": project,
+        "total_files": totals["open"][0] + totals["controlled"][0],
+        "open": {"files": totals["open"][0], "bytes": totals["open"][1]},
+        "controlled": {"files": totals["controlled"][0], "bytes": totals["controlled"][1]},
+        "by_category": by_category,
+    }
+
+
 def plan(project, dest, limit=6):
     """Select the project's slides and write slides_manifest.tsv to `dest`. No download.
 
@@ -322,7 +382,7 @@ def download(project, dest, selected=None, limit=6, on_progress=None):
     Args:
         selected: pre-selected slides; if None, `plan(project, dest, limit)` chooses them.
         limit: sample size when `selected` is None (0/None = all).
-        on_progress: Optional callback(i, total, done_bytes, total_bytes) for the slide phase.
+        on_progress: Optional per-file progress callback for the slide phase (see download_selected).
     """
     if selected is None:
         selected, _ = plan(project, dest, limit)

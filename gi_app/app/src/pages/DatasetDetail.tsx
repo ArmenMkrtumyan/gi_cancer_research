@@ -2,19 +2,20 @@ import { useEffect, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import {
   ArrowLeft, ExternalLink, Database, BarChart3, HeartPulse, ListChecks, Layers,
-  History, AlertCircle,
+  History, AlertCircle, ShieldCheck,
 } from 'lucide-react'
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
 import {
   fetchDatasetSummary, fetchSurvival, fetchMissingness,
-  fetchIngestionRuns,
+  fetchIngestionRuns, fetchDatasetAccess,
   type DatasetSummary, type Survival, type Missingness,
-  type IngestionRun, type MissingnessMetric,
+  type IngestionRun, type MissingnessMetric, type AccessBreakdown,
 } from '@/lib/api'
 import { formatNumber, formatBytes, formatDateTime, humanizeKey, slideTypeLabel } from '@/lib/utils'
 import { CHART } from '@/lib/theme'
 import Section from '@/components/Section'
 import StatusPill from '@/components/StatusPill'
+import AccessBar from '@/components/AccessBar'
 import DistributionChart from '@/components/DistributionChart'
 import MetricBar from '@/components/MetricBar'
 import CohortExplorer from '@/components/CohortExplorer'
@@ -43,6 +44,10 @@ export default function DatasetDetail() {
   const [loading, setLoading] = useState(true)
   const [coreError, setCoreError] = useState<string | null>(null)
 
+  // Access breakdown is a live GDC scan (seconds) — load it separately so it never blocks the page.
+  const [access, setAccess] = useState<AccessBreakdown | null>(null)
+  const [accessLoading, setAccessLoading] = useState(true)
+
   useEffect(() => {
     if (!Number.isFinite(id)) {
       setCoreError('Invalid dataset id')
@@ -50,6 +55,12 @@ export default function DatasetDetail() {
       return
     }
     load(id)
+    setAccessLoading(true)
+    setAccess(null)
+    fetchDatasetAccess(id)
+      .then(setAccess)
+      .catch(() => setAccess(null))
+      .finally(() => setAccessLoading(false))
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id])
 
@@ -138,6 +149,23 @@ export default function DatasetDetail() {
         </div>
       </Section>
 
+      {/* Access & availability */}
+      <Section
+        title="Access & availability"
+        icon={ShieldCheck}
+        description="How much of this project's data at GDC is publicly downloadable vs controlled-access (dbGaP). Clinical & biospecimen metadata is fully open — no fields are hidden; controlled access gates raw genomics (sequencing reads, germline/somatic variants)."
+      >
+        {accessLoading ? (
+          <p className="text-sm text-muted-foreground py-4">Loading access breakdown from GDC…</p>
+        ) : access && access.available ? (
+          <AccessPanel access={access} />
+        ) : (
+          <p className="text-sm text-muted-foreground py-4">
+            {access?.reason || 'Access breakdown is unavailable for this dataset.'}
+          </p>
+        )}
+      </Section>
+
       {/* Distributions */}
       <Section title="Key distributions" icon={BarChart3} description="How this cohort breaks down across a few key attributes.">
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
@@ -193,6 +221,56 @@ function MiniStat({ label, value, hint }: { label: string; value: string | numbe
     >
       <p className="text-2xl font-bold text-brand tabular-nums">{value}</p>
       <p className="text-xs text-muted-foreground mt-0.5">{label}</p>
+    </div>
+  )
+}
+
+function AccessPanel({ access }: { access: AccessBreakdown }) {
+  const open = access.open ?? { files: 0, bytes: 0 }
+  const controlled = access.controlled ?? { files: 0, bytes: 0 }
+  const categories = access.by_category ?? []
+  return (
+    <div className="space-y-5">
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+        <MiniStat label="Open files" value={formatNumber(open.files)} hint="Publicly downloadable — no authorization needed" />
+        <MiniStat label="Open volume" value={formatBytes(open.bytes)} hint="Total size of openly downloadable files" />
+        <MiniStat label="Controlled files" value={formatNumber(controlled.files)} hint="Require dbGaP / NIH authorization to download" />
+        <MiniStat label="Controlled volume" value={formatBytes(controlled.bytes)} hint="Total size behind controlled access" />
+      </div>
+
+      <AccessBar open={open} controlled={controlled} height="h-3" />
+
+      <div>
+        <p className="text-sm font-semibold text-brand mb-2">By data category</p>
+        <div className="overflow-x-auto rounded-lg border">
+          <table className="w-full text-sm">
+            <thead className="bg-brand text-white">
+              <tr>
+                <th className="text-left font-semibold px-4 py-2.5">Data category</th>
+                <th className="text-right font-semibold px-4 py-2.5">Open files</th>
+                <th className="text-right font-semibold px-4 py-2.5">Open size</th>
+                <th className="text-right font-semibold px-4 py-2.5">Controlled files</th>
+                <th className="text-right font-semibold px-4 py-2.5">Controlled size</th>
+              </tr>
+            </thead>
+            <tbody>
+              {categories.map((c, i) => (
+                <tr key={c.category} className={i % 2 === 0 ? 'bg-card' : 'bg-muted/40'}>
+                  <td className="px-4 py-2 capitalize">{c.category}</td>
+                  <td className="px-4 py-2 text-right tabular-nums text-emerald-700">{c.open_files ? formatNumber(c.open_files) : '—'}</td>
+                  <td className="px-4 py-2 text-right tabular-nums text-muted-foreground">{c.open_bytes ? formatBytes(c.open_bytes) : '—'}</td>
+                  <td className="px-4 py-2 text-right tabular-nums text-amber-700">{c.controlled_files ? formatNumber(c.controlled_files) : '—'}</td>
+                  <td className="px-4 py-2 text-right tabular-nums text-muted-foreground">{c.controlled_bytes ? formatBytes(c.controlled_bytes) : '—'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {access.fetched_at && (
+        <p className="text-xs text-muted-foreground">Live from GDC · fetched {formatDateTime(access.fetched_at)}</p>
+      )}
     </div>
   )
 }

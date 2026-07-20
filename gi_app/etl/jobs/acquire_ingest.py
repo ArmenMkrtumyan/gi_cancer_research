@@ -34,6 +34,7 @@ import slide_ingest  # noqa: E402
 import tcga_ingest  # noqa: E402
 from Database.database import SessionLocal  # noqa: E402
 from Database.models import DownloadJob  # noqa: E402
+from logging_setup import configure_logging  # noqa: E402
 
 
 def update_job(job_id, *, status=None, message=None, n_slides=None,
@@ -71,6 +72,12 @@ def main():
     p.add_argument("--limit", type=int, default=6, help="total slides to sample (0 = all / full)")
     args = p.parse_args()
 
+    # Emit the ingest modules' INFO trace to this subprocess's stdout (captured in the
+    # api container logs). Without this the root logger has no handlers and every
+    # loader's progress line is silently dropped — leaving only the one-line failure
+    # message on the download_jobs row to debug from.
+    configure_logging()
+
     project = args.project
     page_url = args.page_url or f"https://portal.gdc.cancer.gov/projects/{project}"
     dest = os.path.join(_WORK, project)
@@ -80,12 +87,13 @@ def main():
         selected, _manifest = gdc_acquire.plan(project, dest, args.limit)
         update_job(args.job_id, n_slides=len(selected))
 
-        def _progress(i, total, done_bytes, total_bytes):
+        def _progress(i, total, hit, file_done, file_size):
+            # Report the specific file in flight (not an aggregate) so the UI mirrors the manifest.
             update_job(
                 args.job_id,
-                message=f"Downloading slide {i} of {total}…",
-                bytes_done=done_bytes,
-                bytes_total=total_bytes,
+                message=f"Slide {i} of {total}: {hit['file_name']}",
+                bytes_done=file_done,
+                bytes_total=file_size,
             )
 
         gdc_acquire.download(project, dest, selected, on_progress=_progress)

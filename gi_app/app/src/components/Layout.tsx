@@ -5,7 +5,7 @@ import { cn } from '@/lib/utils'
 
 const navItems = [
   { to: '/', label: 'Overview', icon: LayoutDashboard, end: true },
-  { to: '/add-data', label: 'Add data', icon: DownloadCloud, end: false },
+  { to: '/add-data', label: 'Data', icon: DownloadCloud, end: false },
 ]
 
 // External developer tools (defaults match docker-compose port mappings).

@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 from math import ceil
 from typing import Optional
@@ -22,11 +23,13 @@ from sqlalchemy.orm import Session
 
 import storage
 import wsi
-from Database.database import get_db
+from Database.database import get_db, SessionLocal
 from Database.models import (
     Aliquot,
     Analyte,
     Annotation,
+    AnnotationRepresentation,
+    AnnotationSet,
     Case,
     DataAsset,
     Dataset,
@@ -59,6 +62,34 @@ app.add_middleware(
 )
 
 
+@app.on_event("startup")
+def _reconcile_orphaned_jobs() -> None:
+    """Fail any download job left mid-flight by a server restart.
+
+    A download/ingest runs in a subprocess that is a child of THIS API process, so an API
+    restart (redeploy, crash, `docker compose up` touching the api container) kills it
+    silently. The job row would otherwise stay stuck at 'downloading'/'ingesting' forever
+    and the UI would poll a dead job. Reaching this startup hook proves that child is gone,
+    so flip any still-active job to 'failed' with a clear reason.
+    """
+    session = SessionLocal()
+    try:
+        stale = (
+            session.query(DownloadJob)
+            .filter(DownloadJob.status.in_(["pending", "downloading", "ingesting"]))
+            .all()
+        )
+        for job in stale:
+            job.status = "failed"
+            job.message = "Interrupted: the server restarted while this job was running. Please re-download."
+            job.finished_at = datetime.now(timezone.utc)
+        if stale:
+            session.commit()
+            print(f"[startup] Reconciled {len(stale)} orphaned download job(s) -> failed.")
+    finally:
+        session.close()
+
+
 def _value(v):
     """Return a JSON-friendly value for SQLAlchemy enum/string/date-ish values."""
     return getattr(v, "value", v)
@@ -89,6 +120,76 @@ def _dataset_or_404(db: Session, dataset_id: int) -> Dataset:
     if ds is None:
         raise HTTPException(status_code=404, detail=f"Dataset {dataset_id} not found")
     return ds
+
+
+# child->parent delete order for a dataset's case-scoped rows (mirrors
+# tcga_ingest._RESET_CASE_SCOPED). data_assets + ingestion_runs + cases are cleared
+# separately; download_catalog/download_jobs are NOT touched (they're the wishlist/audit log).
+_CASE_SCOPED_TABLES = [
+    "aliquots", "analytes", "portions", "slides",
+    "molecular_tests", "follow_ups", "pathology_details", "treatments",
+    "samples", "diagnoses",
+]
+
+
+def _purge_dataset(db: Session, ds: Dataset) -> dict:
+    """Delete an ingested dataset entirely: its stored slide objects, then all of its
+    Postgres rows (data_assets, case-scoped children, cases, ingestion_runs, the dataset).
+
+    Storage deletion is best-effort and runs first so a stuck object never blocks freeing
+    the database rows; any failures are reported back rather than aborting the purge.
+
+    Args:
+        db: The active SQLAlchemy session.
+        ds: The dataset to remove.
+
+    Returns:
+        A summary: objects deleted, bytes freed, and any per-object storage errors.
+    """
+    dataset_id = ds.dataset_id
+    assets = db.query(DataAsset).filter(DataAsset.dataset_id == dataset_id).all()
+    objects_deleted, bytes_freed, storage_errors = 0, 0, []
+    for asset in assets:
+        try:
+            storage.delete_object(asset.uri)
+            objects_deleted += 1
+            bytes_freed += _count(asset.size_bytes)
+        except Exception as exc:  # noqa: BLE001 — report, don't abort the DB purge
+            storage_errors.append(f"{_filename(asset.uri) or asset.uri}: {exc}")
+
+    # Annotations first: representations reference assets, annotations reference sets and
+    # assets, so they must go before data_assets. Purging a dataset removes its published
+    # annotations too — unlike a re-ingest, this is an explicit "delete everything" action.
+    db.execute(text("""
+        DELETE FROM annotation_representations WHERE annotation_id IN (
+            SELECT a.annotation_id FROM annotations a
+            JOIN annotation_sets s ON s.annotation_set_id = a.annotation_set_id
+            WHERE s.dataset_id = :d)
+    """), {"d": dataset_id})
+    db.execute(text("""
+        DELETE FROM annotations WHERE annotation_set_id IN (
+            SELECT annotation_set_id FROM annotation_sets WHERE dataset_id = :d)
+    """), {"d": dataset_id})
+    db.execute(text("DELETE FROM annotation_sets WHERE dataset_id = :d"), {"d": dataset_id})
+    # Derivatives point at their source asset; clear the self-reference before deleting.
+    db.execute(text("UPDATE data_assets SET derived_from_asset_id = NULL WHERE dataset_id = :d"),
+               {"d": dataset_id})
+    db.execute(text("DELETE FROM data_assets WHERE dataset_id = :d"), {"d": dataset_id})
+    case_subq = "SELECT case_id FROM cases WHERE dataset_id = :d"
+    for table in _CASE_SCOPED_TABLES:
+        db.execute(text(f"DELETE FROM {table} WHERE case_id IN ({case_subq})"), {"d": dataset_id})
+    db.execute(text("DELETE FROM ingestion_runs WHERE dataset_id = :d"), {"d": dataset_id})
+    db.execute(text("DELETE FROM cases WHERE dataset_id = :d"), {"d": dataset_id})
+    db.query(Dataset).filter(Dataset.dataset_id == dataset_id).delete()
+    db.commit()
+
+    return {
+        "deleted": dataset_id,
+        "dataset_name": ds.name,
+        "objects_deleted": objects_deleted,
+        "bytes_freed": bytes_freed,
+        "storage_errors": storage_errors,
+    }
 
 
 def _dataset_stats(db: Session) -> dict[int, dict]:
@@ -237,6 +338,15 @@ def get_dataset(dataset_id: int, db: Session = Depends(get_db)):
     return payload
 
 
+@app.delete("/datasets/{dataset_id}")
+def delete_dataset(dataset_id: int, db: Session = Depends(get_db)):
+    """Permanently remove an ingested dataset: its stored slide files AND all of its
+    Postgres records. Frees local disk. The download-registry entry is left intact so the
+    dataset can be re-downloaded later; use DELETE /catalog/{id} to drop that separately."""
+    ds = _dataset_or_404(db, dataset_id)
+    return _purge_dataset(db, ds)
+
+
 @app.get("/stats/overview")
 def stats_overview(db: Session = Depends(get_db)):
     """High-level dashboard counts across all ingested data."""
@@ -294,6 +404,36 @@ def stats_dataset_stats(db: Session = Depends(get_db)):
         }
         for r in rows
     ]
+
+
+# GDC project composition changes rarely, and the byte-volume scan pages tens of thousands of
+# files, so cache the breakdown per project. Keyed by project id -> (fetched_at_epoch, payload).
+_ACCESS_CACHE: dict = {}
+_ACCESS_TTL = 6 * 3600  # 6 hours
+
+
+@app.get("/datasets/{dataset_id}/access")
+def dataset_access(dataset_id: int, db: Session = Depends(get_db)):
+    """Live GDC open-vs-controlled file breakdown for this dataset's project (counts + bytes +
+    per-category split). Cached ~6h. Non-GDC datasets return {available: false}."""
+    ds = _dataset_or_404(db, dataset_id)
+    import gdc_acquire
+    try:
+        project = gdc_acquire.resolve_project(ds.official_page or "")
+    except gdc_acquire.AcquireError:
+        return {"available": False, "reason": "Access breakdown is only available for GDC/TCGA datasets."}
+
+    now = time.time()
+    cached = _ACCESS_CACHE.get(project)
+    if cached and now - cached[0] < _ACCESS_TTL:
+        return cached[1]
+    try:
+        payload = gdc_acquire.access_breakdown(project)
+    except Exception as exc:  # noqa: BLE001 — surface GDC failure as a 502
+        raise HTTPException(status_code=502, detail=f"GDC query failed: {exc}") from exc
+    payload["fetched_at"] = datetime.now(timezone.utc).isoformat()
+    _ACCESS_CACHE[project] = (now, payload)
+    return payload
 
 
 @app.get("/datasets/{dataset_id}/summary")
@@ -844,6 +984,413 @@ def slide_thumbnail(asset_id: int, db: Session = Depends(get_db)):
                     headers={"Cache-Control": "public, max-age=86400"})
 
 
+# ---------------------------------------------------------------------------
+# Annotations
+#
+# Every annotation payload carries its set's provenance (provider, method, licence,
+# citation) and an explicit `is_spatial` flag, so a caller can never mistake a published
+# algorithmic result for a project-generated or pathologist-reviewed label.
+# ---------------------------------------------------------------------------
+_SPATIAL_SCOPES = ("region", "nucleus", "patch", "tile")
+
+# Source-defined GDC categories that matter when selecting a cohort. These are the
+# source's own words; the grouping below is a UI convenience, not a source judgement.
+_FLAG_GROUPS = {
+    "dnu": ["Item flagged DNU"],
+    "redaction": ["Subject withdrew consent", "Item is noncanonical.redaction"],
+    "qc_failure": ["Center QC failed", "Item may not meet study protocol",
+                   "Item does not meet study protocol", "Pathology outside specification",
+                   "Qualification metrics changed", "Inadvertently shipped"],
+    "noncanonical": ["Item is noncanonical"],
+    "prior_malignancy": ["Prior malignancy", "Synchronous malignancy",
+                         "History of acceptable prior treatment related to a prior/other malignancy",
+                         "History of unacceptable prior treatment related to a prior/other malignancy"],
+}
+
+
+def _flag_group(category: Optional[str], classification: Optional[str]) -> Optional[str]:
+    """Map a source category/classification onto a UI filter group, or None.
+
+    This is presentation grouping only — it never re-labels the source values, which are
+    always returned verbatim alongside it.
+    """
+    if classification == "Redaction":
+        return "redaction"
+    for group, cats in _FLAG_GROUPS.items():
+        if category in cats:
+            return group
+    return None
+
+
+def _set_payload(s: AnnotationSet) -> dict:
+    """Serialize an annotation set — the provenance record for its annotations."""
+    return {
+        "annotation_set_id": s.annotation_set_id,
+        "dataset_id": s.dataset_id,
+        "name": s.name,
+        "provider": s.provider,
+        "source_url": s.source_url,
+        "citation": s.citation,
+        "license": s.license,
+        "version": s.version,
+        "method": s.method,
+        "origin": s.origin,
+        "description": s.description,
+        "retrieved_at": s.retrieved_at,
+        "is_algorithmic": s.method == "algorithmic",
+        "is_published_derived": s.origin == "published_derived",
+    }
+
+
+def _annotation_payload(a: Annotation, s: AnnotationSet, n_reps: int = 0) -> dict:
+    """Serialize an annotation together with its provenance and spatial status."""
+    return {
+        "annotation_id": a.annotation_id,
+        "source_annotation_id": a.source_annotation_id,
+        "case_id": a.case_id,
+        "target_asset_id": a.target_asset_id,
+        "scope": a.scope,
+        "is_spatial": a.scope in _SPATIAL_SCOPES,
+        "annotation_type": a.annotation_type,
+        "label": a.label,
+        "category": a.category,
+        "classification": a.classification,
+        "value_text": a.value_text,
+        "value_number": a.value_number,
+        "units": a.units,
+        "confidence": a.confidence,
+        "review_status": a.review_status,
+        "source_entity_type": a.source_entity_type,
+        "source_entity_submitter_id": a.source_entity_submitter_id,
+        "notes": a.notes,
+        "source_created_datetime": a.source_created_datetime,
+        "flag_group": _flag_group(a.category, a.classification),
+        "representation_count": n_reps,
+        "annotation_set": _set_payload(s),
+    }
+
+
+def _annotations_query(db: Session):
+    """Base query joining annotations to their set, with a representation count."""
+    rep_count = (
+        db.query(AnnotationRepresentation.annotation_id.label("aid"),
+                 func.count(AnnotationRepresentation.representation_id).label("n"))
+        .group_by(AnnotationRepresentation.annotation_id)
+        .subquery()
+    )
+    return (
+        db.query(Annotation, AnnotationSet, func.coalesce(rep_count.c.n, 0))
+        .join(AnnotationSet, Annotation.annotation_set_id == AnnotationSet.annotation_set_id)
+        .outerjoin(rep_count, rep_count.c.aid == Annotation.annotation_id)
+    )
+
+
+@app.get("/annotation-sets")
+def list_annotation_sets(dataset_id: Optional[int] = Query(None), db: Session = Depends(get_db)):
+    """List annotation collections and their provenance, with annotation counts."""
+    q = db.query(AnnotationSet)
+    if dataset_id is not None:
+        q = q.filter(AnnotationSet.dataset_id == dataset_id)
+    sets = q.order_by(AnnotationSet.annotation_set_id).all()
+    counts = dict(
+        db.query(Annotation.annotation_set_id, func.count(Annotation.annotation_id))
+        .group_by(Annotation.annotation_set_id).all()
+    )
+    return {
+        "total": len(sets),
+        "annotation_sets": [
+            {**_set_payload(s), "annotation_count": _count(counts.get(s.annotation_set_id, 0))}
+            for s in sets
+        ],
+    }
+
+
+@app.get("/cases/{case_id}/annotations")
+def case_annotations(case_id: str, db: Session = Depends(get_db)):
+    """All annotations recorded against a case (spatial and non-spatial)."""
+    rows = (_annotations_query(db)
+            .filter(Annotation.case_id == case_id)
+            .order_by(Annotation.scope, Annotation.category, Annotation.annotation_id)
+            .all())
+    return {
+        "case_id": case_id,
+        "total": len(rows),
+        "annotations": [_annotation_payload(a, s, n) for a, s, n in rows],
+    }
+
+
+@app.get("/assets/{asset_id}/annotations")
+def asset_annotations(asset_id: int, db: Session = Depends(get_db)):
+    """Annotations targeting one exact WSI asset."""
+    _data_asset_or_404(db, asset_id)
+    rows = (_annotations_query(db)
+            .filter(Annotation.target_asset_id == asset_id)
+            .order_by(Annotation.annotation_id)
+            .all())
+    return {
+        "asset_id": asset_id,
+        "total": len(rows),
+        "annotations": [_annotation_payload(a, s, n) for a, s, n in rows],
+    }
+
+
+@app.get("/assets/{asset_id}/spatial-representations")
+def asset_spatial_representations(asset_id: int, db: Session = Depends(get_db)):
+    """Renderable spatial layers for a WSI, with the geometry needed to place them.
+
+    `transform_metadata` carries the recorded scale/offset from the source, so the viewer
+    positions a layer from measured numbers instead of stretching it to fit.
+    """
+    _data_asset_or_404(db, asset_id)
+    rows = (
+        db.query(AnnotationRepresentation, Annotation, AnnotationSet, DataAsset)
+        .join(Annotation, AnnotationRepresentation.annotation_id == Annotation.annotation_id)
+        .join(AnnotationSet, Annotation.annotation_set_id == AnnotationSet.annotation_set_id)
+        .join(DataAsset, AnnotationRepresentation.asset_id == DataAsset.asset_id)
+        .filter(Annotation.target_asset_id == asset_id)
+        .order_by(Annotation.annotation_id, AnnotationRepresentation.representation_id)
+        .all()
+    )
+    # A rendering derivative is typed `rendering_derivative` whatever it depicts, so on its own
+    # it cannot say whether it draws a continuous probability map or a thresholded binary mask.
+    # Carry the ORIGINAL's type across from its sibling under the same annotation: a viewer that
+    # guesses would label a binary mask with a 0–1 probability scale.
+    source_types = {
+        ann.annotation_id: rep.representation_type
+        for rep, ann, _aset, rep_asset in rows
+        if rep_asset.asset_type == "annotation_source"
+    }
+
+    layers = []
+    for rep, ann, aset, rep_asset in rows:
+        # Only the browser-renderable derivative can be drawn; the preserved source file
+        # is offered as a download instead.
+        renderable = rep_asset.format in ("png", "jpeg", "jpg")
+        layers.append({
+            "source_representation_type": source_types.get(
+                ann.annotation_id, rep.representation_type),
+            "representation_id": rep.representation_id,
+            "annotation_id": ann.annotation_id,
+            "annotation_label": ann.label,
+            "annotation_type": ann.annotation_type,
+            "representation_type": rep.representation_type,
+            "coordinate_space": rep.coordinate_space,
+            "width": rep.width,
+            "height": rep.height,
+            "level": rep.level,
+            "minimum_value": rep.minimum_value,
+            "maximum_value": rep.maximum_value,
+            "transform_metadata": rep.transform_metadata,
+            "asset_id": rep_asset.asset_id,
+            "asset_format": rep_asset.format,
+            "asset_type": rep_asset.asset_type,
+            "is_renderable": renderable,
+            "is_source_original": rep_asset.asset_type == "annotation_source",
+            "image_url": (f"/annotations/representations/{rep.representation_id}/image"
+                          if renderable else None),
+            "annotation_set": _set_payload(aset),
+        })
+    return {"asset_id": asset_id, "total": len(layers), "layers": layers}
+
+
+@app.get("/annotations/representations/{representation_id}/image")
+def representation_image(representation_id: int, db: Session = Depends(get_db)):
+    """Serve a spatial representation's rendered image for the viewer overlay."""
+    row = (
+        db.query(AnnotationRepresentation, DataAsset)
+        .join(DataAsset, AnnotationRepresentation.asset_id == DataAsset.asset_id)
+        .filter(AnnotationRepresentation.representation_id == representation_id)
+        .one_or_none()
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Representation {representation_id} not found")
+    rep, asset = row
+    if asset.format not in ("png", "jpeg", "jpg"):
+        raise HTTPException(
+            status_code=415,
+            detail=(f"Representation {representation_id} is stored as {asset.format!r}, which the "
+                    "browser cannot render directly. Use the asset download URL instead."),
+        )
+    try:
+        data = wsi.fetch_bytes(asset.asset_id, asset.uri)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not read overlay: {exc}") from exc
+    media = "image/png" if asset.format == "png" else "image/jpeg"
+    return Response(content=data, media_type=media,
+                    headers={"Cache-Control": "public, max-age=86400"})
+
+
+# ---------------------------------------------------------------------------
+# Patient clinical timeline
+# ---------------------------------------------------------------------------
+# Ordering for events that share a day, so a day's group reads in clinical order.
+_EVENT_ORDER = {
+    "diagnosis": 0, "sample_collection": 1, "slide_available": 2, "treatment_start": 3,
+    "treatment_end": 4, "molecular_test": 5, "follow_up": 6, "progression": 7,
+    "recurrence": 8, "last_follow_up": 9, "death": 10, "other_diagnosis": 11,
+    # Administrative rather than clinical, so it sorts below the patient's own events.
+    "sample_received": 12,
+}
+
+
+def _collapse_identical(events):
+    """Merge same-day events that are indistinguishable, keeping every source id.
+
+    TCGA files successive follow-up form revisions (`_follow_up`, `_follow_up2`, …) that
+    RESTATE the last known assessment instead of replacing it, so roughly half of all
+    follow-up days carry more than one record saying exactly the same thing. Rendered
+    verbatim that reads as a duplication bug.
+
+    Only records identical in every displayed field are merged. Records that share a day but
+    DISAGREE (~5% of multi-record days carry conflicting `disease_response`) stay separate —
+    that disagreement is real signal and must remain visible. `source_count` reports how many
+    source records a card stands for, and `ref_ids` keeps all of them addressable.
+
+    Args:
+        events: Event dicts for a single day.
+
+    Returns:
+        A new list with indistinguishable events merged.
+    """
+    merged = {}
+    for e in events:
+        key = (e["event_type"], e["label"], e["detail"], e["timing_basis"], e["asset_id"])
+        if key in merged:
+            merged[key]["source_count"] += 1
+            merged[key]["ref_ids"].append(e["ref_id"])
+        else:
+            merged[key] = {**e, "ref_ids": [e["ref_id"]]}
+    return list(merged.values())
+
+
+def _drop_redundant_last_follow_up(timed, case):
+    """Remove the last-known-follow-up card when it lands on the patient's death day.
+
+    TCGA records a death by setting last contact to the death day: `days_to_last_follow_up`
+    equals `days_to_death` for every dead patient in the cohort. The card therefore carries
+    no information a dead patient's timeline doesn't already show, while crowding the column.
+    It is kept for living patients, where last contact is the most recent real assessment.
+
+    Args:
+        timed: {day: [event, ...]}, mutated in place.
+        case: The Case row, for `days_to_death`.
+    """
+    if case.days_to_death is None:
+        return
+    day = int(case.days_to_death)
+    if day in timed:
+        timed[day] = [e for e in timed[day] if e["event_type"] != "last_follow_up"]
+
+
+@app.get("/cases/{case_id}/timeline")
+def case_timeline(case_id: str, db: Session = Depends(get_db)):
+    """Longitudinal clinical events for one patient, grouped by relative day.
+
+    Read from the `case_timeline` view, so every event is a source record — nothing is
+    interpolated and no visit is invented. Events whose source carries no usable date are
+    returned separately as `untimed` rather than being placed on the axis at a guess.
+
+    Days are relative to the initial pathologic diagnosis (day 0), which is the unit TCGA
+    records; there are no absolute calendar dates in the source.
+    """
+    case = db.query(Case).filter(Case.case_id == case_id).one_or_none()
+    if case is None:
+        raise HTTPException(status_code=404, detail=f"Case {case_id} not found")
+
+    rows = db.execute(text("""
+        SELECT event_type, day, timing_basis, label, detail, ref_table, ref_id, asset_id
+        FROM case_timeline WHERE case_id = :c
+    """), {"c": case_id}).fetchall()
+
+    timed, untimed = {}, []
+    for r in rows:
+        event = {
+            "event_type": r[0], "day": r[1], "timing_basis": r[2], "label": r[3],
+            "detail": r[4], "ref_table": r[5], "ref_id": r[6], "asset_id": r[7],
+            "source_count": 1,
+        }
+        if r[1] is None:
+            untimed.append(event)
+        else:
+            timed.setdefault(int(r[1]), []).append(event)
+
+    for day in list(timed):
+        timed[day] = _collapse_identical(timed[day])
+    _drop_redundant_last_follow_up(timed, case)
+
+    for events in timed.values():
+        events.sort(key=lambda e: (_EVENT_ORDER.get(e["event_type"], 99), e["label"] or ""))
+    untimed.sort(key=lambda e: (_EVENT_ORDER.get(e["event_type"], 99), e["label"] or ""))
+
+    groups = [{"day": d, "events": timed[d]} for d in sorted(timed)]
+    days = sorted(timed)
+    return {
+        "case_id": case_id,
+        "case_barcode": case.submitter_id,
+        "baseline": "initial pathologic diagnosis (day 0)",
+        "day_unit": "days relative to diagnosis",
+        "total_events": len(rows),
+        # Counts SOURCE records, not cards: a collapsed card stands for `source_count` of
+        # them, so the header total stays faithful to the source even though fewer cards show.
+        "timed_event_count": sum(e["source_count"] for g in groups for e in g["events"]),
+        "untimed_event_count": len(untimed),
+        "first_day": days[0] if days else None,
+        "last_day": days[-1] if days else None,
+        "has_longitudinal_data": len(days) > 1,
+        "groups": groups,
+        "untimed": untimed,
+    }
+
+
+@app.get("/cases/{case_id}")
+def get_case(case_id: str, db: Session = Depends(get_db)):
+    """One patient's core record, with their diagnosis, slides and annotation counts."""
+    row = (
+        db.query(Case, Dataset)
+        .join(Dataset, Case.dataset_id == Dataset.dataset_id)
+        .filter(Case.case_id == case_id)
+        .one_or_none()
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Case {case_id} not found")
+    case, ds = row
+    dx = (
+        db.query(Diagnosis)
+        .filter(Diagnosis.case_id == case_id)
+        .order_by(Diagnosis.diagnosis_is_primary_disease.desc().nullslast())
+        .first()
+    )
+    slides = (
+        db.query(Slide, DataAsset)
+        .join(DataAsset, DataAsset.slide_id == Slide.slide_id)
+        .filter(Slide.case_id == case_id, DataAsset.asset_type == "wsi")
+        .order_by(Slide.submitter_id)
+        .all()
+    )
+    n_ann = _count(db.query(func.count(Annotation.annotation_id))
+                   .filter(Annotation.case_id == case_id).scalar())
+    return {
+        "case_id": case.case_id,
+        "case_barcode": case.submitter_id,
+        "dataset_id": ds.dataset_id,
+        "dataset_name": ds.name,
+        "primary_site": case.primary_site,
+        "disease_type": case.disease_type,
+        "sex_at_birth": _value(case.sex_at_birth),
+        "vital_status": _value(case.vital_status),
+        "days_to_death": case.days_to_death,
+        "primary_diagnosis": dx.primary_diagnosis if dx else None,
+        "ajcc_pathologic_stage": dx.ajcc_pathologic_stage if dx else None,
+        "age_at_diagnosis": dx.age_at_diagnosis if dx else None,
+        "annotation_count": n_ann,
+        "slides": [
+            {"slide_id": s.slide_id, "slide_barcode": s.submitter_id,
+             "slide_type": s.slide_type, "asset_id": a.asset_id}
+            for s, a in slides
+        ],
+    }
+
+
 @app.get("/ingestion-runs")
 def list_ingestion_runs(dataset_id: Optional[int] = Query(None),
                         limit: int = Query(100, ge=1, le=500),
@@ -911,7 +1458,7 @@ def _job_payload(job: DownloadJob) -> dict:
 @app.get("/catalog")
 def list_catalog(db: Session = Depends(get_db)):
     """The download registry, with per-entry ingest state + latest job status."""
-    ingested_names = {n for (n,) in db.query(Dataset.name).all()}
+    ds_by_name = {name: did for did, name in db.query(Dataset.dataset_id, Dataset.name).all()}
     out = []
     for c in db.query(DownloadCatalog).order_by(DownloadCatalog.id).all():
         latest = (
@@ -928,7 +1475,8 @@ def list_catalog(db: Session = Depends(get_db)):
             "gi_cancer_types": c.gi_cancer_types,
             "notes": c.notes,
             "downloadable": c.source_type == "gdc",
-            "ingested": c.name in ingested_names,
+            "ingested": c.name in ds_by_name,
+            "dataset_id": ds_by_name.get(c.name),  # the ingested dataset to purge, if any
             "latest_job": _job_payload(latest) if latest else None,
         })
     return out

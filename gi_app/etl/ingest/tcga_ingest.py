@@ -23,6 +23,7 @@ from Database.models import (
     Aliquot,
     Analyte,
     Annotation,
+    AnnotationSet,
     Case,
     Diagnosis,
     FollowUp,
@@ -42,10 +43,12 @@ DATASET_NAME = "TCGA-COAD"
 DATASET_FOLDER = os.environ.get("TCGA_FOLDER", "TCGA_COAD")
 COAD_PAGE = "https://portal.gdc.cancer.gov/projects/TCGA-COAD"
 
-# case_id-scoped child tables, child->parent delete order. data_assets + cases are cleared
-# by dataset_id separately; ingestion_runs is kept (append-only audit log).
+# case_id-scoped child tables, child->parent delete order. cases are cleared by dataset_id
+# separately; ingestion_runs is kept (append-only audit log). `annotations` is NOT in this
+# list — it is cleared selectively (see reset) so published spatial annotations survive a
+# re-ingest of the source project.
 _RESET_CASE_SCOPED = [
-    "annotations", "aliquots", "analytes", "portions", "slides",
+    "aliquots", "analytes", "portions", "slides",
     "molecular_tests", "follow_ups", "pathology_details", "treatments",
     "samples", "diagnoses",
 ]
@@ -69,6 +72,19 @@ def reset(session, dataset_id):
     Scoped by dataset_id so multiple datasets coexist — re-ingesting one project must never
     touch another's data. ingestion_runs is kept (append-only audit log).
 
+    This connector owns exactly one kind of annotation: the `source_provided` GDC set for
+    this dataset. Everything else in the annotation system — published spatial collections,
+    their representations and their stored files — belongs to a different importer and is
+    preserved here. Two consequences:
+
+      * `data_assets` rows are NOT deleted. Spatial annotations point at slide assets by
+        `asset_id`, so those ids must stay stable across a re-ingest; `slide_ingest`
+        upserts them by URI instead. The `slide_id` link is cleared because the `slides`
+        rows themselves are reloaded, and is re-established afterwards.
+      * Surviving annotations temporarily lose their `case_id` (the cases they point at are
+        about to be deleted and reloaded with the same UUIDs); `relink_published_annotations`
+        restores it from the target asset once the new rows are in.
+
     Args:
         session: The active SQLAlchemy session.
         dataset_id: The dataset whose rows to clear.
@@ -77,13 +93,69 @@ def reset(session, dataset_id):
         None.
     """
     from sqlalchemy import text
-    session.execute(text("DELETE FROM data_assets WHERE dataset_id = :d"), {"d": dataset_id})
     case_subq = "SELECT case_id FROM cases WHERE dataset_id = :d"
+
+    # Drop this dataset's GDC annotations (and the set itself) — they are re-derived below.
+    session.execute(text("""
+        DELETE FROM annotation_representations WHERE annotation_id IN (
+            SELECT a.annotation_id FROM annotations a
+            JOIN annotation_sets s ON s.annotation_set_id = a.annotation_set_id
+            WHERE s.dataset_id = :d AND s.origin = 'source_provided')
+    """), {"d": dataset_id})
+    session.execute(text("""
+        DELETE FROM annotations WHERE annotation_set_id IN (
+            SELECT annotation_set_id FROM annotation_sets
+            WHERE dataset_id = :d AND origin = 'source_provided')
+    """), {"d": dataset_id})
+    session.execute(text("""
+        DELETE FROM annotation_sets WHERE dataset_id = :d AND origin = 'source_provided'
+    """), {"d": dataset_id})
+
+    # Detach surviving (published) annotations from the cases about to be deleted.
+    session.execute(text(f"""
+        UPDATE annotations SET case_id = NULL
+        WHERE case_id IN ({case_subq})
+    """), {"d": dataset_id})
+
+    # Keep the asset rows; only the slide linkage is rebuilt.
+    session.execute(text(
+        "UPDATE data_assets SET slide_id = NULL WHERE dataset_id = :d"), {"d": dataset_id})
+
     for table in _RESET_CASE_SCOPED:
         session.execute(text(f"DELETE FROM {table} WHERE case_id IN ({case_subq})"), {"d": dataset_id})
     session.execute(text("DELETE FROM cases WHERE dataset_id = :d"), {"d": dataset_id})
     session.commit()
-    logger.info(f"Cleared existing rows for dataset {dataset_id} (clean reload).")
+    logger.info(f"Cleared existing rows for dataset {dataset_id} (clean reload; "
+                "published annotations and stored files preserved).")
+
+
+def relink_published_annotations(session, dataset_id):
+    """Restore `case_id` on preserved spatial annotations after a reload.
+
+    Their target asset is the authority: asset -> slide -> case. Runs after the slides have
+    been reloaded and `slide_ingest` has re-linked assets to them.
+
+    Args:
+        session: The active SQLAlchemy session.
+        dataset_id: The dataset whose annotations to re-link.
+
+    Returns:
+        The number of annotations re-linked.
+    """
+    from sqlalchemy import text
+    n = session.execute(text("""
+        UPDATE annotations a
+        SET case_id = sl.case_id
+        FROM data_assets da
+        JOIN slides sl ON sl.slide_id = da.slide_id
+        WHERE a.target_asset_id = da.asset_id
+          AND a.case_id IS NULL
+          AND da.dataset_id = :d
+    """), {"d": dataset_id}).rowcount
+    session.commit()
+    if n:
+        logger.info(f"Re-linked {n} published annotations to their reloaded cases.")
+    return n
 
 
 # --------------------------------------------------------------------------- #
@@ -392,6 +464,7 @@ def load_samples(session, cmap):
             shortest_dimension=E.to_float(r.get("shortest_dimension")),
             intermediate_dimension=E.to_float(r.get("intermediate_dimension")),
             initial_weight=E.to_float(r.get("initial_weight")),
+            days_to_sample_procurement=E.to_int(r.get("days_to_sample_procurement")),
             days_to_collection=E.to_int(r.get("days_to_collection")),
             created_datetime=E.to_dt(r.get("created_datetime")),
             updated_datetime=E.to_dt(r.get("updated_datetime")),
@@ -547,12 +620,59 @@ def load_slides(session, cmap, smap):
 # --------------------------------------------------------------------------- #
 # Curation
 # --------------------------------------------------------------------------- #
-def load_annotations(session, cmap):
+def get_or_create_gdc_annotation_set(session, dataset_id, dataset_name):
+    """Return the GDC annotation set for this dataset, creating it if absent.
+
+    Collection-level provenance (provider, licence, citation, method) is stored once here
+    rather than repeated on all ~1.1k annotation rows.
+
+    Args:
+        session: The active SQLAlchemy session.
+        dataset_id: The dataset the set belongs to.
+        dataset_name: Dataset name, used in the set's display name.
+
+    Returns:
+        The existing or newly created AnnotationSet.
+    """
+    name = f"GDC Annotations — {dataset_name}"
+    s = (session.query(AnnotationSet)
+         .filter_by(dataset_id=dataset_id, name=name, version="1").one_or_none())
+    if s is None:
+        s = AnnotationSet(
+            dataset_id=dataset_id, name=name,
+            provider="GDC (Genomic Data Commons)",
+            source_url="https://portal.gdc.cancer.gov/annotations",
+            citation=("Genomic Data Commons Data Portal, National Cancer Institute. "
+                      "Annotations are administrative/QC notes recorded by the "
+                      "data-coordinating centre."),
+            license="NCI GDC Data Portal terms of use",
+            version="1",
+            method="manual",           # curator-entered notes, not model output
+            origin="source_provided",
+            description=("Administrative and quality-control notes recorded against GDC "
+                         "entities. Non-spatial: these carry no slide coordinates, "
+                         "polygons or masks."),
+            retrieved_at=datetime.now(timezone.utc),
+            created_at=datetime.now(timezone.utc),
+        )
+        session.add(s)
+        session.flush()
+    return s
+
+
+def load_annotations(session, cmap, dataset_id, dataset_name):
     """Load the barcode-resolvable rows of annotations.tsv into the annotations table.
+
+    GDC annotations are administrative/QC notes about an entity — never slide regions — so
+    they are recorded as scope='case', annotation_type='qc', with no target asset. The GDC
+    annotation UUID is preserved as `source_annotation_id`, and the source entity type and
+    barcode are preserved verbatim.
 
     Args:
         session: The active SQLAlchemy session.
         cmap: Barcode -> case_id lookup.
+        dataset_id: The dataset being ingested.
+        dataset_name: Dataset name, for the annotation set's display name.
 
     Returns:
         None.
@@ -561,6 +681,8 @@ def load_annotations(session, cmap):
     if not os.path.exists(path):
         logger.warning("annotations.tsv not found — skipping.")
         return
+    aset = get_or_create_gdc_annotation_set(session, dataset_id, dataset_name)
+    now = datetime.now(timezone.utc)
     rows, skipped = [], 0
     for r in E.read_dicts(path):
         aid = E.s(r.get("annotation_id"))
@@ -572,17 +694,27 @@ def load_annotations(session, cmap):
         if not cid:  # genomic-file rows / unknown cases: not barcode-resolvable
             skipped += 1
             continue
+        category = E.s(r.get("category"))
         rows.append(dict(
-            annotation_id=aid, entity_type=E.s(r.get("entity_type")),
-            entity_submitter_id=ent, case_id=cid,
-            category=E.s(r.get("category")),
+            annotation_set_id=aset.annotation_set_id,
+            source_annotation_id=aid,
+            case_id=cid,
+            target_asset_id=None,      # administrative note: not tied to an image
+            scope="case",
+            annotation_type="qc",
+            label=category,
+            category=category,
             classification=E.s(r.get("classification")),
+            source_entity_type=E.s(r.get("entity_type")),
+            source_entity_submitter_id=ent,
             notes=E.s(r.get("notes")),
-            created_datetime=E.to_dt(r.get("created_datetime")),
+            source_created_datetime=E.to_dt(r.get("created_datetime")),
+            created_at=now,
         ))
-    rows = E.dedup_by_pk(rows, "annotation_id")
+    rows = E.dedup_by_pk(rows, "source_annotation_id")
     session.bulk_insert_mappings(Annotation, rows)
-    logger.info(f"annotations: {len(rows)} loaded, {skipped} skipped (non-barcode/genomic-file)")
+    logger.info(f"annotations: {len(rows)} loaded into set {aset.annotation_set_id}, "
+                f"{skipped} skipped (non-barcode/genomic-file)")
 
 
 def main(dataset_name=DATASET_NAME, project_id="TCGA-COAD", page_url=COAD_PAGE,
@@ -627,7 +759,9 @@ def main(dataset_name=DATASET_NAME, project_id="TCGA-COAD", page_url=COAD_PAGE,
         load_aliquots(session, cmap, smap)
         load_slides(session, cmap, smap)
 
-        load_annotations(session, cmap)
+        load_annotations(session, cmap, dataset_id, dataset_name)
+        session.commit()
+        relink_published_annotations(session, dataset_id)
 
         session.add(IngestionRun(
             dataset_id=dataset_id, connector="tcga_ingest",

@@ -174,6 +174,20 @@ def put_file(local_path: str, uri: str, target: str = "local") -> None:
     client(target).upload_file(local_path, bucket, key)
 
 
+def delete_object(uri: str, target: str = None) -> None:
+    """Delete an object from storage (idempotent — no error if it's already gone).
+
+    Args:
+        uri: The object's s3:// URI.
+        target: Storage target; inferred from the URI's bucket when omitted.
+
+    Returns:
+        None.
+    """
+    bucket, key = parse_s3_uri(uri)
+    client(target or target_for_uri(uri)).delete_object(Bucket=bucket, Key=key)
+
+
 def download_file(uri: str, local_path: str, target: str = None) -> None:
     """Download an object from storage to a local path.
 

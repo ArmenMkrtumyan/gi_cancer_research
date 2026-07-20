@@ -82,6 +82,31 @@ def tile(asset_id: int, uri: str, level: int, col: int, row: int) -> bytes:
     return buf.getvalue()
 
 
+def fetch_bytes(asset_id: int, uri: str) -> bytes:
+    """Return a small object-storage file's bytes, caching it locally on first use.
+
+    Used for annotation overlay images, which are orders of magnitude smaller than a slide
+    and are served whole rather than tiled.
+
+    Args:
+        asset_id: The asset's id (names the cache file).
+        uri: The object's s3:// URI.
+
+    Returns:
+        The file's raw bytes.
+    """
+    ext = os.path.splitext(uri)[1] or ".bin"
+    path = os.path.join(CACHE_DIR, f"asset{asset_id}{ext}")
+    if not os.path.exists(path):
+        with _registry_lock:
+            if not os.path.exists(path):
+                tmp = f"{path}.part"
+                storage.download_file(uri, tmp)
+                os.replace(tmp, path)  # publish atomically so readers never see a partial file
+    with open(path, "rb") as f:
+        return f.read()
+
+
 def thumbnail(asset_id: int, uri: str, size: int = 800) -> bytes:
     """Return a downscaled overview of the whole slide as JPEG bytes."""
     osr, _dz, lock = _open(asset_id, uri)

@@ -319,7 +319,16 @@ export interface CatalogEntry {
   notes: string | null
   downloadable: boolean
   ingested: boolean
+  dataset_id: number | null // the ingested dataset (present when `ingested`); target for purge
   latest_job: DownloadJob | null
+}
+
+export interface PurgeResult {
+  deleted: number
+  dataset_name: string
+  objects_deleted: number
+  bytes_freed: number
+  storage_errors: string[]
 }
 
 export interface ManifestSlide {
@@ -345,6 +354,25 @@ export interface StorageTargets {
   aws: boolean
 }
 
+export interface AccessCategory {
+  category: string
+  open_files: number
+  open_bytes: number
+  controlled_files: number
+  controlled_bytes: number
+}
+
+export interface AccessBreakdown {
+  available: boolean
+  reason?: string
+  project?: string
+  total_files?: number
+  open?: { files: number; bytes: number }
+  controlled?: { files: number; bytes: number }
+  by_category?: AccessCategory[]
+  fetched_at?: string
+}
+
 export function fetchCatalog(): Promise<CatalogEntry[]> {
   return getJson<CatalogEntry[]>('/catalog')
 }
@@ -357,6 +385,11 @@ export function deleteCatalog(id: number): Promise<{ deleted: number }> {
   return sendJson('DELETE', `/catalog/${id}`)
 }
 
+/** Permanently delete an ingested dataset's slide files + Postgres records (frees disk). */
+export function purgeDataset(datasetId: number): Promise<PurgeResult> {
+  return sendJson<PurgeResult>('DELETE', `/datasets/${datasetId}`)
+}
+
 export function fetchManifest(id: number, limit: number | null): Promise<Manifest> {
   return sendJson<Manifest>('POST', `/catalog/${id}/manifest`, { limit })
 }
@@ -367,4 +400,161 @@ export function startDownload(id: number, target: string, limit: number | null):
 
 export function fetchStorageTargets(): Promise<StorageTargets> {
   return getJson<StorageTargets>('/storage-targets')
+}
+
+export function fetchDatasetAccess(id: number): Promise<AccessBreakdown> {
+  return getJson<AccessBreakdown>(`/datasets/${id}/access`)
+}
+
+// ---- Annotations -----------------------------------------------------------
+// Every annotation carries the provenance of the collection it came from, so the UI can
+// always show where a label originated and whether a person or an algorithm produced it.
+
+export interface AnnotationSet {
+  annotation_set_id: number
+  dataset_id: number
+  name: string
+  provider: string | null
+  source_url: string | null
+  citation: string | null
+  license: string | null
+  version: string | null
+  method: string | null
+  origin: string
+  description: string | null
+  retrieved_at: string | null
+  is_algorithmic: boolean
+  is_published_derived: boolean
+  annotation_count?: number
+}
+
+export interface Annotation {
+  annotation_id: number
+  source_annotation_id: string
+  case_id: string | null
+  target_asset_id: number | null
+  scope: string
+  is_spatial: boolean
+  annotation_type: string | null
+  label: string | null
+  category: string | null
+  classification: string | null
+  value_text: string | null
+  value_number: number | null
+  units: string | null
+  confidence: number | null
+  review_status: string | null
+  source_entity_type: string | null
+  source_entity_submitter_id: string | null
+  notes: string | null
+  source_created_datetime: string | null
+  /** UI grouping only — never a source judgement. See _FLAG_GROUPS in the API. */
+  flag_group: string | null
+  representation_count: number
+  annotation_set: AnnotationSet
+}
+
+/** Scale/offset placing a representation on slide level 0, recorded at import time. */
+export interface TransformMetadata {
+  coordinate_space: string
+  level: number
+  slide_width_px: number
+  slide_height_px: number
+  grid_columns: number
+  grid_rows: number
+  level0_px_per_map_px_x: number
+  level0_px_per_map_px_y: number
+  offset_x_px: number
+  offset_y_px: number
+  extent_x_px: number
+  extent_y_px: number
+}
+
+export interface SpatialLayer {
+  representation_id: number
+  annotation_id: number
+  annotation_label: string | null
+  annotation_type: string | null
+  representation_type: string
+  /**
+   * What the ORIGINAL file is (`probability_map` | `binary_mask` | …). A rendering derivative
+   * is always typed `rendering_derivative`, so this is the only field that says what a
+   * drawable layer actually depicts.
+   */
+  source_representation_type: string
+  coordinate_space: string | null
+  width: number | null
+  height: number | null
+  level: number | null
+  minimum_value: number | null
+  maximum_value: number | null
+  transform_metadata: TransformMetadata | null
+  asset_id: number
+  asset_format: string | null
+  asset_type: string | null
+  is_renderable: boolean
+  is_source_original: boolean
+  image_url: string | null
+  annotation_set: AnnotationSet
+}
+
+export interface TimelineEvent {
+  event_type: string
+  day: number | null
+  timing_basis: string
+  label: string | null
+  detail: string | null
+  ref_table: string | null
+  ref_id: string | null
+  asset_id: number | null
+  /** How many identical source records this card stands for (1 unless merged). */
+  source_count?: number
+  /** Every source id behind the card, present when source_count > 1. */
+  ref_ids?: string[]
+}
+
+export interface TimelineGroup {
+  day: number
+  events: TimelineEvent[]
+}
+
+export interface CaseTimeline {
+  case_id: string
+  case_barcode: string
+  baseline: string
+  day_unit: string
+  total_events: number
+  timed_event_count: number
+  untimed_event_count: number
+  first_day: number | null
+  last_day: number | null
+  has_longitudinal_data: boolean
+  groups: TimelineGroup[]
+  untimed: TimelineEvent[]
+}
+
+export function fetchAnnotationSets(datasetId?: number): Promise<{ total: number; annotation_sets: AnnotationSet[] }> {
+  const q = datasetId === undefined ? '' : `?dataset_id=${datasetId}`
+  return getJson(`/annotation-sets${q}`)
+}
+
+export function fetchCaseAnnotations(caseId: string): Promise<{ case_id: string; total: number; annotations: Annotation[] }> {
+  return getJson(`/cases/${caseId}/annotations`)
+}
+
+export function fetchAssetAnnotations(assetId: number): Promise<{ asset_id: number; total: number; annotations: Annotation[] }> {
+  return getJson(`/assets/${assetId}/annotations`)
+}
+
+export function fetchSpatialLayers(assetId: number): Promise<{ asset_id: number; total: number; layers: SpatialLayer[] }> {
+  return getJson(`/assets/${assetId}/spatial-representations`)
+}
+
+export function fetchCaseTimeline(caseId: string): Promise<CaseTimeline> {
+  return getJson(`/cases/${caseId}/timeline`)
+}
+
+/** Absolute URL for an overlay image (OpenSeadragon needs a full URL, not a path). */
+export function overlayImageUrl(path: string): string {
+  return `${API_BASE_URL}${path}`
 }

@@ -13,17 +13,19 @@ String, validated/normalized in ETL. Survival is a VIEW (see init_db.py), not a 
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    CheckConstraint,
     Column,
     DateTime,
     Enum,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 
 from Database.database import Base
 
@@ -49,8 +51,21 @@ ethnicity = Enum("hispanic_or_latino", "not_hispanic_or_latino", "not_reported",
 yes_no = Enum("yes", "no", "not_reported", name="yes_no")
 tissue_type = Enum("tumor", "normal", name="tissue_type")
 section_location = Enum("top", "bottom", "not_reported", name="section_location")
-asset_type = Enum("wsi", name="asset_type")
 asset_layer = Enum("bronze", "silver", "gold", name="asset_layer")
+
+# ---------------------------------------------------------------------------
+# Open vocabularies — varchar + CHECK, NOT Postgres enums. These grow every time a
+# new annotation source is onboarded, and `ALTER TYPE ... ADD VALUE` cannot run in
+# the same transaction that uses the new value, which makes enums a poor fit for a
+# migration-driven workflow. Same typing policy the clinical vocabularies already use.
+# ---------------------------------------------------------------------------
+ASSET_TYPES = ("wsi", "annotation_source", "annotation_mask", "annotation_vector", "rendering_cache")
+ANNOTATION_ORIGINS = ("source_provided", "published_derived")
+ANNOTATION_METHODS = ("manual", "algorithmic", "mixed", "not_reported")
+# Scopes that are inherently spatial: they describe a location *on a slide*, so they
+# must name the exact WSI they sit on (enforced by a CHECK below).
+SPATIAL_SCOPES = ("region", "nucleus", "patch", "tile")
+ANNOTATION_SCOPES = ("case", "slide") + SPATIAL_SCOPES
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +266,12 @@ class Sample(Base):
     shortest_dimension = Column(Float)
     intermediate_dimension = Column(Float)
     initial_weight = Column(Float)
+    # Two different dates, routinely confused. `days_to_sample_procurement` is the clinical
+    # event: the day the tissue was taken from the patient. `days_to_collection` is the day
+    # the biobank RECEIVED it for processing — an administrative date that is often years
+    # later and can legitimately fall after the patient's death. Both are days from the GDC
+    # index date, which is the initial diagnosis for these TCGA cases.
+    days_to_sample_procurement = Column(Integer)
     days_to_collection = Column(Integer)
     created_datetime = Column(DateTime(timezone=True))
     updated_datetime = Column(DateTime(timezone=True))
@@ -336,41 +357,149 @@ class Slide(Base):
 
 
 # ---------------------------------------------------------------------------
-# Curation
+# Curation / annotations
+#
+# NOTE (design reversal, 2026-07-20): the original schema reserved a separate
+# `slide_labels` table for pathology-AI labels and kept `annotations` for GDC
+# admin/QC notes only. That is superseded. `annotations` is now the single logical
+# annotation table for BOTH, because every annotation — administrative or spatial —
+# needs the same provenance chain, and one table means one API and one provenance
+# path instead of two parallel ones. Semantic separation is carried by `origin`,
+# `scope` and `annotation_type` rather than by table identity. See docs/schema_logs.md.
 # ---------------------------------------------------------------------------
+class AnnotationSet(Base):
+    """One imported annotation collection/release — the provenance record.
+
+    Collection-level metadata (provider, licence, citation, method) lives here exactly
+    once instead of being repeated on every annotation row.
+    """
+
+    __tablename__ = "annotation_sets"
+    __table_args__ = (
+        UniqueConstraint("dataset_id", "name", "version", name="uq_annotation_sets_dataset_name_version"),
+        CheckConstraint(
+            "origin IN " + str(ANNOTATION_ORIGINS), name="ck_annotation_sets_origin"
+        ),
+        CheckConstraint(
+            "method IN " + str(ANNOTATION_METHODS), name="ck_annotation_sets_method"
+        ),
+    )
+
+    annotation_set_id = Column(Integer, primary_key=True, autoincrement=True)
+    dataset_id = Column(Integer, ForeignKey("datasets.dataset_id"), nullable=False, index=True)
+    name = Column(String, nullable=False)
+    provider = Column(String)          # GDC, Stony Brook / IDC, ...
+    source_url = Column(String)
+    citation = Column(Text)
+    license = Column(String)
+    version = Column(String, nullable=False, default="1")  # part of the uniqueness key
+    method = Column(String)            # manual | algorithmic | mixed | not_reported
+    origin = Column(String, nullable=False)  # source_provided | published_derived
+    description = Column(Text)
+    retrieved_at = Column(DateTime(timezone=True))
+    created_at = Column(DateTime(timezone=True))
+
+
 class Annotation(Base):
-    """A GDC QC/administrative flag, resolved to a case."""
+    """One logical annotation. Non-spatial (GDC QC note) or spatial (published overlay).
+
+    `case_id` is a controlled denormalization for spatial rows (derivable via
+    target_asset -> slide -> case); the ETL invariant is that it always equals the
+    target asset's case. It is kept because every read path filters by case.
+    """
 
     __tablename__ = "annotations"
+    __table_args__ = (
+        UniqueConstraint("annotation_set_id", "source_annotation_id",
+                         name="uq_annotations_set_source_id"),
+        CheckConstraint("scope IN " + str(ANNOTATION_SCOPES), name="ck_annotations_scope"),
+        # A spatial annotation must name the exact WSI it sits on.
+        CheckConstraint(
+            "scope NOT IN " + str(SPATIAL_SCOPES) + " OR target_asset_id IS NOT NULL",
+            name="ck_annotations_spatial_needs_asset",
+        ),
+        Index("ix_annotations_set_scope", "annotation_set_id", "scope"),
+    )
 
-    annotation_id = Column(UUID(as_uuid=False), primary_key=True)
-    entity_type = Column(String)
-    entity_submitter_id = Column(String, nullable=False, index=True)
+    annotation_id = Column(Integer, primary_key=True, autoincrement=True)  # internal surrogate
+    annotation_set_id = Column(Integer, ForeignKey("annotation_sets.annotation_set_id"),
+                               nullable=False, index=True)
+    source_annotation_id = Column(String, nullable=False)  # GDC annotation UUID / IDC series UID
     case_id = Column(UUID(as_uuid=False), ForeignKey("cases.case_id"), index=True)
+    target_asset_id = Column(Integer, ForeignKey("data_assets.asset_id"), index=True)
+    scope = Column(String, nullable=False, default="case")
+    annotation_type = Column(String)   # qc | TIL | nuclei | tumor | ...
+    label = Column(String)
     category = Column(String)
     classification = Column(String)
+    value_text = Column(Text)
+    value_number = Column(Float)
+    units = Column(String)
+    confidence = Column(Float)
+    review_status = Column(String)
+    source_entity_type = Column(String)          # preserved GDC entity_type
+    source_entity_submitter_id = Column(String, index=True)  # preserved GDC barcode
     notes = Column(Text)
-    created_datetime = Column(DateTime(timezone=True))
+    source_created_datetime = Column(DateTime(timezone=True))
+    source_updated_datetime = Column(DateTime(timezone=True))
+    created_at = Column(DateTime(timezone=True))
+
+
+class AnnotationRepresentation(Base):
+    """One stored representation of a spatial annotation (mask / vector / source file).
+
+    The bytes never live in Postgres — `asset_id` points at the object-storage file.
+    """
+
+    __tablename__ = "annotation_representations"
+    __table_args__ = (
+        UniqueConstraint("annotation_id", "asset_id", name="uq_annotation_reps_annotation_asset"),
+    )
+
+    representation_id = Column(Integer, primary_key=True, autoincrement=True)
+    annotation_id = Column(Integer, ForeignKey("annotations.annotation_id"),
+                           nullable=False, index=True)
+    asset_id = Column(Integer, ForeignKey("data_assets.asset_id"), nullable=False, index=True)
+    representation_type = Column(String)   # binary_mask | probability_map | polygon | points
+    coordinate_space = Column(String)      # level_0_pixels | DICOM_slide_coordinates
+    width = Column(Integer)                # representation grid width (not slide width)
+    height = Column(Integer)
+    level = Column(Integer)
+    transform_metadata = Column(JSONB)     # scale/offset needed to place it on level 0
+    minimum_value = Column(Float)
+    maximum_value = Column(Float)
+    created_at = Column(DateTime(timezone=True))
 
 
 # ---------------------------------------------------------------------------
 # File pointers → object storage
 # ---------------------------------------------------------------------------
 class DataAsset(Base):
-    """Pointer to a file in object storage (e.g. a .svs slide in MinIO/S3)."""
+    """Pointer to a file in object storage (.svs slide, annotation mask, derivative, ...).
+
+    `asset_type` is varchar + CHECK (see ASSET_TYPES) rather than a Postgres enum so new
+    asset types can be added by a plain migration. `derived_from_asset_id` keeps the
+    original published annotation file distinct from any viewer-compatible derivative
+    generated from it — the original is never overwritten.
+    """
 
     __tablename__ = "data_assets"
+    __table_args__ = (
+        CheckConstraint("asset_type IN " + str(ASSET_TYPES), name="ck_data_assets_asset_type"),
+    )
 
     asset_id = Column(Integer, primary_key=True, autoincrement=True)
     dataset_id = Column(Integer, ForeignKey("datasets.dataset_id"), nullable=False, index=True)
     slide_id = Column(UUID(as_uuid=False), ForeignKey("slides.slide_id"), index=True)  # set for wsi
-    asset_type = Column(asset_type)
+    asset_type = Column(String)
     layer = Column(asset_layer)
     uri = Column(String, nullable=False)  # s3://gi-cancer/bronze/TCGA-COAD/slides/<file>.svs
-    format = Column(String)  # svs, parquet, ...
+    format = Column(String)  # svs, parquet, dcm, png, ...
     md5 = Column(String)
     size_bytes = Column(BigInteger)
-    source_file_id = Column(String)  # GDC file UUID
+    source_file_id = Column(String)  # GDC file UUID / IDC crdc_series_uuid
+    source_uri = Column(String)      # where it was fetched from (external provenance)
+    derived_from_asset_id = Column(Integer, ForeignKey("data_assets.asset_id"), index=True)
     created_at = Column(DateTime(timezone=True))
 
 

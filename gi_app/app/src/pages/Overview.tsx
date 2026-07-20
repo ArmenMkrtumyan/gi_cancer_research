@@ -6,12 +6,16 @@ import {
 import {
   BarChart, Bar, Cell, XAxis, YAxis, Tooltip, ResponsiveContainer,
 } from 'recharts'
-import { fetchOverview, type Overview as OverviewData, type DatasetRow } from '@/lib/api'
+import {
+  fetchOverview, fetchDatasetAccess,
+  type Overview as OverviewData, type DatasetRow, type AccessBreakdown,
+} from '@/lib/api'
 import { formatNumber, formatBytes } from '@/lib/utils'
 import { SERIES } from '@/lib/theme'
 import StatCard from '@/components/StatCard'
 import Section from '@/components/Section'
 import StatusPill from '@/components/StatusPill'
+import AccessBar from '@/components/AccessBar'
 import { Badge } from '@/components/ui/badge'
 
 // A run is "clean" when it finished successfully — no need to surface it in that case.
@@ -24,6 +28,35 @@ function AccessBadge({ access }: { access: string | null }) {
   return access.toLowerCase() === 'open'
     ? <Badge variant="success">open</Badge>
     : <Badge variant="gold">{access}</Badge>
+}
+
+/** Live open-vs-controlled split for one dataset, loaded lazily so the table renders instantly. */
+function AccessCell({ datasetId, fallback }: { datasetId: number; fallback: string | null }) {
+  const [acc, setAcc] = useState<AccessBreakdown | null>(null)
+  const [failed, setFailed] = useState(false)
+
+  useEffect(() => {
+    let alive = true
+    fetchDatasetAccess(datasetId)
+      .then((d) => alive && setAcc(d))
+      .catch(() => alive && setFailed(true))
+    return () => {
+      alive = false
+    }
+  }, [datasetId])
+
+  if (failed || (acc && !acc.available)) return <AccessBadge access={fallback} />
+  if (!acc || !acc.open || !acc.controlled) {
+    return <span className="text-xs text-muted-foreground">loading…</span>
+  }
+  return (
+    <div className="min-w-[160px]">
+      <AccessBar open={acc.open} controlled={acc.controlled} />
+      <p className="text-[11px] text-muted-foreground mt-1">
+        {formatNumber(acc.total_files)} files · {formatBytes(acc.open.bytes)} open
+      </p>
+    </div>
+  )
 }
 
 export default function Overview() {
@@ -157,7 +190,7 @@ function DatasetTable({ rows }: { rows: DatasetRow[] }) {
                 </Link>
               </td>
               <td className="px-4 py-3 text-muted-foreground">{d.gi_cancer_types || '—'}</td>
-              <td className="px-4 py-3"><AccessBadge access={d.access_type} /></td>
+              <td className="px-4 py-3"><AccessCell datasetId={d.dataset_id} fallback={d.access_type} /></td>
               <td className="px-4 py-3 text-right tabular-nums">{formatNumber(d.n_cases)}</td>
               <td className="px-4 py-3 text-right tabular-nums">{formatNumber(d.n_files)}</td>
             </tr>

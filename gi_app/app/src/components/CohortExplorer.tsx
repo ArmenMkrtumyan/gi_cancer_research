@@ -4,8 +4,18 @@ import { fetchCases, type CohortCase, type CaseSlide } from '@/lib/api'
 import { formatNumber, slideTypeLabel, slideTypeDescription } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import SlideViewer from '@/components/SlideViewer'
+import PatientTimeline from '@/components/PatientTimeline'
+import AnnotationPanel from '@/components/AnnotationPanel'
 
 const ALL = 'All'
+
+type PatientTab = 'slide' | 'timeline' | 'annotations'
+
+const TAB_LABELS: Record<PatientTab, string> = {
+  slide: 'Slide viewer',
+  timeline: 'Clinical timeline',
+  annotations: 'Metadata & annotations',
+}
 
 function uniqueSorted(values: (string | null)[]): string[] {
   return Array.from(new Set(values.filter((v): v is string => !!v))).sort()
@@ -22,7 +32,10 @@ export default function CohortExplorer({ datasetId }: { datasetId: number }) {
   const [stage, setStage] = useState(ALL)
   const [withSlidesOnly, setWithSlidesOnly] = useState(false)
 
-  const [viewing, setViewing] = useState<{ slide: CaseSlide; caseBarcode: string | null } | null>(null)
+  const [viewing, setViewing] = useState<
+    { slide: CaseSlide; caseBarcode: string | null; caseId: string } | null
+  >(null)
+  const [tab, setTab] = useState<PatientTab>('slide')
 
   useEffect(() => {
     let cancelled = false
@@ -103,7 +116,40 @@ export default function CohortExplorer({ datasetId }: { datasetId: number }) {
               <X className="h-4 w-4 mr-1" /> Close
             </Button>
           </div>
-          <SlideViewer assetId={viewing.slide.asset_id} />
+
+          <div className="flex items-center gap-1 border-b mb-3">
+            {(['slide', 'timeline', 'annotations'] as PatientTab[]).map((t) => (
+              <button
+                key={t}
+                type="button"
+                onClick={() => setTab(t)}
+                className={`px-3 py-1.5 text-sm border-b-2 -mb-px transition-colors ${
+                  tab === t
+                    ? 'border-brand text-brand font-medium'
+                    : 'border-transparent text-muted-foreground hover:text-foreground'
+                }`}
+              >
+                {TAB_LABELS[t]}
+              </button>
+            ))}
+          </div>
+
+          {/* The viewer stays mounted across tabs so switching away and back does not
+              re-download tiles or reset the zoom the user had set. */}
+          <div className={tab === 'slide' ? '' : 'hidden'}>
+            <SlideViewer assetId={viewing.slide.asset_id} />
+          </div>
+          {tab === 'timeline' && (
+            <PatientTimeline
+              caseId={viewing.caseId}
+              onOpenSlide={(assetId) => {
+                const match = cases?.flatMap((c) => c.slides).find((s) => s.asset_id === assetId)
+                if (match) setViewing({ ...viewing, slide: match })
+                setTab('slide')
+              }}
+            />
+          )}
+          {tab === 'annotations' && <AnnotationPanel caseId={viewing.caseId} />}
         </div>
       )}
 
@@ -138,7 +184,9 @@ export default function CohortExplorer({ datasetId }: { datasetId: number }) {
                           size="sm"
                           variant="outline"
                           title={slideTypeDescription(s.slide_type)}
-                          onClick={() => setViewing({ slide: s, caseBarcode: c.case_barcode })}
+                          onClick={() =>
+                            setViewing({ slide: s, caseBarcode: c.case_barcode, caseId: c.case_id })
+                          }
                         >
                           <Eye className="h-3.5 w-3.5 mr-1" /> {slideTypeLabel(s.slide_type)}
                         </Button>

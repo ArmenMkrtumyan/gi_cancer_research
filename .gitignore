@@ -16,6 +16,9 @@ __pycache__/
 *.pyc
 .venv/
 
+# Pre-migration database exports (local safety net; regenerable with pg_dump)
+backups/
+
 # Local env & service state
 gi_app/.env
 gi_app/pgadmin_data/

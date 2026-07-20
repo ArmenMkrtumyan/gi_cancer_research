@@ -10,3 +10,9 @@ boto3==1.35.76
 Pillow==11.0.0
 openslide-python==1.4.1
 openslide-bin
+
+# Published spatial-annotation import (etl/jobs/spatial_manifest.py, til_overlay_import.py).
+# pydicom reads the published DICOM Segmentation objects; pyarrow reads the IDC index
+# parquet files used to match our slides against public annotation collections.
+pydicom==3.0.1
+pyarrow==18.1.0

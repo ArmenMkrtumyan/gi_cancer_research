@@ -12,7 +12,8 @@ from datetime import datetime, timezone
 import etl_utils as E
 import storage
 from Database.database import SessionLocal
-from Database.models import DataAsset, Dataset, Slide
+from Database.models import Annotation, DataAsset, Dataset, Slide
+from ingest.tcga_ingest import relink_published_annotations
 
 logger = logging.getLogger(__name__)
 
@@ -52,12 +53,14 @@ def main(dataset_name=DATASET_NAME, project_id="TCGA-COAD", folder=None, target=
         smap = {s_id: sid for s_id, sid in
                 session.query(Slide.submitter_id, Slide.slide_id).all()}
 
-        # idempotent: clear this dataset's wsi assets, then re-register
-        session.query(DataAsset).filter_by(dataset_id=dataset_id, asset_type="wsi").delete()
-        session.commit()
+        # Idempotent by URI rather than delete-and-reinsert: spatial annotations target a
+        # slide by asset_id, so re-running the ETL must not hand the same file a new id.
+        existing = {a.uri: a for a in session.query(DataAsset)
+                    .filter_by(dataset_id=dataset_id, asset_type="wsi").all()}
 
         slides_dir = os.path.join(E.DATA_ROOT, DATASET_FOLDER, "slides")
-        n_up, n_reg, missing = 0, 0, []
+        n_up, n_new, n_upd, missing = 0, 0, 0, []
+        seen = set()
         for r in E.read_dicts(manifest):
             fname = E.s(r.get("file_name"))
             barcode = E.s(r.get("barcode"))
@@ -71,20 +74,44 @@ def main(dataset_name=DATASET_NAME, project_id="TCGA-COAD", folder=None, target=
             uri = storage.build_uri("bronze", project_id, "slides", fname, target=target)
             storage.put_file(local, uri, target=target)
             n_up += 1
+            seen.add(uri)
 
             slide_id = smap.get(barcode)
             if slide_id is None:
                 logger.warning(f"no slides row matches barcode {barcode} (asset still registered)")
-            session.add(DataAsset(
+            fields = dict(
                 dataset_id=dataset_id, slide_id=slide_id, asset_type="wsi", layer="bronze",
-                uri=uri, format="svs", md5=E.s(r.get("md5")),
-                size_bytes=os.path.getsize(local), source_file_id=E.s(r.get("file_id")),
-                created_at=datetime.now(timezone.utc),
-            ))
-            n_reg += 1
+                format="svs", md5=E.s(r.get("md5")), size_bytes=os.path.getsize(local),
+                source_file_id=E.s(r.get("file_id")),
+            )
+            asset = existing.get(uri)
+            if asset is None:
+                session.add(DataAsset(uri=uri, created_at=datetime.now(timezone.utc), **fields))
+                n_new += 1
+            else:
+                for k, v in fields.items():
+                    setattr(asset, k, v)
+                n_upd += 1
+
+        # Retire assets no longer in the manifest, unless an annotation still points at one
+        # (dropping those would silently orphan published spatial work).
+        stale = [a for uri, a in existing.items() if uri not in seen]
+        kept = 0
+        for a in stale:
+            refs = session.query(Annotation).filter_by(target_asset_id=a.asset_id).count()
+            if refs:
+                kept += 1
+                continue
+            session.delete(a)
 
         session.commit()
-        logger.info(f"slides: uploaded {n_up}, registered {n_reg} data_assets")
+        logger.info(f"slides: uploaded {n_up}, registered {n_new} new + {n_upd} updated data_assets"
+                    + (f", kept {kept} stale asset(s) still referenced by annotations" if kept else ""))
+
+        # Restoring asset -> slide linkage is what makes a published annotation's case
+        # resolvable again, so the re-link belongs here rather than in tcga_ingest (which
+        # runs before these links exist).
+        relink_published_annotations(session, dataset_id)
         if missing:
             logger.warning(f"{len(missing)} slide files listed in manifest but missing on disk: {missing}")
     except Exception:

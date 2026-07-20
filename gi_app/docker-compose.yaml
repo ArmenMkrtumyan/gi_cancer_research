@@ -136,6 +136,9 @@ services:
       - ./api:/api
       - ./shared:/shared
       - ./etl:/etl
+      # Tests run inside this container so they hit the real database and the real models:
+      #   docker exec gi_app-api-1 python -m pytest /tests -q
+      - ./tests:/tests
     ports:
       - 8008:8000
     <<: [*database-env, *db-dependency]

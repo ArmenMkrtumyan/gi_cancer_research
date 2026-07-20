@@ -6,8 +6,11 @@ enum members) while evolving vocabularies stay as free-text varchar.
 """
 
 import csv
+import logging
 import os
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
 
 DATA_ROOT = os.environ.get("DATA_ROOT", "/data")
 
@@ -20,12 +23,20 @@ def read_dicts(path):
 
     Not for files with duplicate column names — use read_rows for those (see diagnoses).
 
+    A missing file is treated as zero rows (returns []), not an error: the acquisition
+    step writes a per-entity TSV only when that entity has at least one row, so an absent
+    file legitimately means the project has none of that entity (e.g. TCGA-PAAD has no
+    molecular tests, so no molecular_tests.tsv is written).
+
     Args:
         path: Path to the TSV file.
 
     Returns:
-        A list of dicts, one per data row (column name -> value).
+        A list of dicts, one per data row (column name -> value); [] if the file is absent.
     """
+    if not os.path.exists(path):
+        logger.warning("TSV not found, treating as empty: %s", path)
+        return []
     with open(path, newline="", encoding="utf-8") as f:
         return list(csv.DictReader(f, delimiter="\t"))
 
@@ -33,15 +44,21 @@ def read_dicts(path):
 def read_rows(path):
     """Read a TSV as raw rows for index-based access (handles duplicate column names).
 
+    A missing (or empty) file is treated as zero rows — see read_dicts for why.
+
     Args:
         path: Path to the TSV file.
 
     Returns:
-        A (header, rows) tuple: the header list and a list of row lists.
+        A (header, rows) tuple: the header list and a list of row lists;
+        ([], []) if the file is absent or empty.
     """
+    if not os.path.exists(path):
+        logger.warning("TSV not found, treating as empty: %s", path)
+        return [], []
     with open(path, newline="", encoding="utf-8") as f:
         reader = csv.reader(f, delimiter="\t")
-        header = next(reader)
+        header = next(reader, [])
         return header, list(reader)
 
 
