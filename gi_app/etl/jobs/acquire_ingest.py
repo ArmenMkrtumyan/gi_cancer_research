@@ -30,6 +30,8 @@ for _sub in ("", "connectors", "ingest"):
         sys.path.insert(0, _p)
 
 import gdc_acquire  # noqa: E402
+import gdc_reports  # noqa: E402
+import report_ingest  # noqa: E402
 import slide_ingest  # noqa: E402
 import tcga_ingest  # noqa: E402
 from Database.database import SessionLocal  # noqa: E402
@@ -70,6 +72,8 @@ def main():
     p.add_argument("--page-url", default=None)
     p.add_argument("--target", default="local", choices=["local", "aws"])
     p.add_argument("--limit", type=int, default=6, help="total slides to sample (0 = all / full)")
+    p.add_argument("--no-reports", action="store_true",
+                   help="skip the pathology-report PDFs (they are fetched for every case by default)")
     args = p.parse_args()
 
     # Emit the ingest modules' INFO trace to this subprocess's stdout (captured in the
@@ -98,12 +102,32 @@ def main():
 
         gdc_acquire.download(project, dest, selected, on_progress=_progress)
 
+        # Reports are fetched for the whole cohort, not just the sampled slides: they are
+        # small (~100 KB each) and GDC publishes one per case, so this is the only source
+        # that gives every ingested patient a document. Slides stay sampled because a
+        # single .svs is ~500 MB.
+        if not args.no_reports:
+            def _report_progress(i, total, row):
+                update_job(args.job_id,
+                           message=f"Pathology report {i} of {total}: {row['file_name']}")
+
+            update_job(args.job_id, status="downloading", message="Fetching pathology reports…")
+            gdc_reports.acquire(
+                project, os.path.join(dest, "pathology_reports"),
+                on_progress=_report_progress,
+            )
+
         update_job(args.job_id, status="ingesting", message="Loading clinical + biospecimen into Postgres…")
         tcga_ingest.main(
             dataset_name=args.name, project_id=project, page_url=page_url,
             cancer_types=args.cancer_types, folder=project, access="mixed",
         )
         slide_ingest.main(dataset_name=args.name, project_id=project, folder=project, target=args.target)
+        # After tcga_ingest: linking a report to its case needs the cases rows to exist.
+        if not args.no_reports:
+            update_job(args.job_id, message="Uploading pathology reports to object storage…")
+            report_ingest.main(dataset_name=args.name, project_id=project,
+                               folder=project, target=args.target)
 
         update_job(args.job_id, status="done", message="Download and ingest complete.", finished=True)
     except Exception as exc:  # noqa: BLE001 — surface any failure to the job row

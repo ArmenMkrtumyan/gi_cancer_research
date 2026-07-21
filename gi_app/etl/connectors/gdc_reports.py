@@ -112,23 +112,75 @@ def _md5(path):
     return h.hexdigest()
 
 
-def download(rows, outdir):
+def download(rows, outdir, on_progress=None):
+    """Stream each report PDF to `outdir`, verifying md5.
+
+    A whole-cohort pull is ~460 files, so one transient network error must not lose the
+    other 459: a failed or corrupt file is reported, skipped, and the run continues. The
+    return value is the rows that actually landed, which is what the ingest step registers
+    — a file that failed here is simply absent downstream rather than half-registered.
+
+    Args:
+        rows: Manifest rows (from `rows_from_hits`).
+        outdir: Destination directory.
+        on_progress: Optional callback(i, total, row) invoked before each download.
+
+    Returns:
+        The subset of `rows` that downloaded and passed md5 verification.
+    """
     os.makedirs(outdir, exist_ok=True)
-    ok = 0
+    got = []
     for i, r in enumerate(rows, 1):
         dest = os.path.join(outdir, r["file_name"])
         size_kb = int(r["size_bytes"] or 0) / 1e3
         print(f"  [{i}/{len(rows)}] {r['file_name']} ({size_kb:.0f} KB) ...", flush=True)
+        if on_progress:
+            on_progress(i, len(rows), r)
         url = f"{GDC_DATA_ENDPOINT}/{r['file_id']}"
-        with urllib.request.urlopen(url, timeout=120) as resp, open(dest, "wb") as out:
-            for chunk in iter(lambda: resp.read(1 << 20), b""):
-                out.write(chunk)
+        try:
+            with urllib.request.urlopen(url, timeout=120) as resp, open(dest, "wb") as out:
+                for chunk in iter(lambda: resp.read(1 << 20), b""):
+                    out.write(chunk)
+        except Exception as exc:  # noqa: BLE001 — one bad file must not end the run
+            print(f"      !! download failed ({exc}) — skipping", file=sys.stderr)
+            if os.path.exists(dest):
+                os.remove(dest)
+            continue
         if r["md5"] and _md5(dest) != r["md5"]:
             print(f"      !! md5 MISMATCH — deleting {r['file_name']}", file=sys.stderr)
             os.remove(dest)
             continue
-        ok += 1
-    print(f"Downloaded + md5-verified {ok}/{len(rows)} report(s) -> {outdir}")
+        got.append(r)
+    print(f"Downloaded + md5-verified {len(got)}/{len(rows)} report(s) -> {outdir}")
+    return got
+
+
+def acquire(project, outdir, only_cases=None, limit=2000, on_progress=None):
+    """Fetch a project's open-access report PDFs — the importable entry point.
+
+    Everything the CLI does minus the printing, so `acquire_ingest` can call it as one
+    step of a download job. Writes reports_manifest.tsv next to the PDFs (the ingest step
+    reads it back for md5/file_id, exactly as slide_ingest reads slides_manifest.tsv).
+
+    Args:
+        project: GDC project_id, e.g. 'TCGA-COAD'.
+        outdir: Directory to write the PDFs and manifest into.
+        only_cases: Optional set of case barcodes to restrict the pull to.
+        limit: Max report files to consider.
+        on_progress: Optional callback(i, total, row) invoked before each download.
+
+    Returns:
+        The manifest rows that were downloaded and md5-verified.
+    """
+    rows = rows_from_hits(query_reports(project, limit))
+    if only_cases:
+        rows = [r for r in rows if r["case"] in only_cases]
+    if not rows:
+        return []
+
+    os.makedirs(outdir, exist_ok=True)
+    write_manifest(rows, os.path.join(outdir, "reports_manifest.tsv"))
+    return download(rows, outdir, on_progress=on_progress)
 
 
 def main():

@@ -37,6 +37,11 @@ python ingest/tcga_ingest.py
 echo ""; echo "== Step 3: upload slides to object storage + register data_assets =="
 python ingest/slide_ingest.py
 
+echo ""; echo "== Step 4: upload pathology-report PDFs + register data_assets =="
+# No-ops with a warning when the reports were never fetched; run
+# `connectors/gdc_reports.py --project TCGA-COAD --download` to populate them.
+python ingest/report_ingest.py
+
 echo ""
 echo "=========================================="
 echo " ETL completed successfully"

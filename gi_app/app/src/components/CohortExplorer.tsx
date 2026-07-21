@@ -1,18 +1,20 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Eye, X, AlertCircle } from 'lucide-react'
-import { fetchCases, type CohortCase, type CaseSlide } from '@/lib/api'
+import { Eye, X, AlertCircle, FileText } from 'lucide-react'
+import { fetchCases, type CohortCase, type CaseSlide, type CaseReport } from '@/lib/api'
 import { formatNumber, slideTypeLabel, slideTypeDescription } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import SlideViewer from '@/components/SlideViewer'
 import PatientTimeline from '@/components/PatientTimeline'
 import AnnotationPanel from '@/components/AnnotationPanel'
+import ReportViewer from '@/components/ReportViewer'
 
 const ALL = 'All'
 
-type PatientTab = 'slide' | 'timeline' | 'annotations'
+type PatientTab = 'slide' | 'report' | 'timeline' | 'annotations'
 
 const TAB_LABELS: Record<PatientTab, string> = {
   slide: 'Slide viewer',
+  report: 'Pathology report',
   timeline: 'Clinical timeline',
   annotations: 'Metadata & annotations',
 }
@@ -32,8 +34,16 @@ export default function CohortExplorer({ datasetId }: { datasetId: number }) {
   const [stage, setStage] = useState(ALL)
   const [withSlidesOnly, setWithSlidesOnly] = useState(false)
 
+  // `slide` is null for a patient opened from their report: pathology reports exist for
+  // essentially every case, while slides are a small sample, so the panel must not require
+  // one. The slide tab is hidden in that state rather than rendering an empty viewer.
   const [viewing, setViewing] = useState<
-    { slide: CaseSlide; caseBarcode: string | null; caseId: string } | null
+    {
+      slide: CaseSlide | null
+      reports: CaseReport[]
+      caseBarcode: string | null
+      caseId: string
+    } | null
   >(null)
   const [tab, setTab] = useState<PatientTab>('slide')
 
@@ -82,6 +92,7 @@ export default function CohortExplorer({ datasetId }: { datasetId: number }) {
     )
 
   const withSlides = cases.filter((c) => c.slides.length > 0).length
+  const withReports = cases.filter((c) => c.pathology_reports.length > 0).length
 
   return (
     <div className="space-y-4">
@@ -99,7 +110,8 @@ export default function CohortExplorer({ datasetId }: { datasetId: number }) {
           Only patients with a slide image
         </label>
         <span className="text-xs text-muted-foreground ml-auto pb-1.5">
-          {formatNumber(filtered.length)} of {formatNumber(cases.length)} patients · {withSlides} with a viewable slide
+          {formatNumber(filtered.length)} of {formatNumber(cases.length)} patients ·{' '}
+          {withSlides} with a viewable slide · {formatNumber(withReports)} with a pathology report
         </span>
       </div>
 
@@ -109,7 +121,7 @@ export default function CohortExplorer({ datasetId }: { datasetId: number }) {
             <p className="text-sm font-semibold text-brand">
               {viewing.caseBarcode}{' '}
               <span className="font-normal text-muted-foreground font-mono text-xs">
-                {viewing.slide.slide_barcode}
+                {viewing.slide?.slide_barcode}
               </span>
             </p>
             <Button size="sm" variant="ghost" onClick={() => setViewing(null)}>
@@ -118,7 +130,9 @@ export default function CohortExplorer({ datasetId }: { datasetId: number }) {
           </div>
 
           <div className="flex items-center gap-1 border-b mb-3">
-            {(['slide', 'timeline', 'annotations'] as PatientTab[]).map((t) => (
+            {(['slide', 'report', 'timeline', 'annotations'] as PatientTab[])
+              .filter((t) => (t === 'slide' ? viewing.slide !== null : true))
+              .map((t) => (
               <button
                 key={t}
                 type="button"
@@ -136,9 +150,12 @@ export default function CohortExplorer({ datasetId }: { datasetId: number }) {
 
           {/* The viewer stays mounted across tabs so switching away and back does not
               re-download tiles or reset the zoom the user had set. */}
-          <div className={tab === 'slide' ? '' : 'hidden'}>
-            <SlideViewer assetId={viewing.slide.asset_id} />
-          </div>
+          {viewing.slide && (
+            <div className={tab === 'slide' ? '' : 'hidden'}>
+              <SlideViewer assetId={viewing.slide.asset_id} />
+            </div>
+          )}
+          {tab === 'report' && <ReportViewer reports={viewing.reports} />}
           {tab === 'timeline' && (
             <PatientTimeline
               caseId={viewing.caseId}
@@ -163,6 +180,7 @@ export default function CohortExplorer({ datasetId }: { datasetId: number }) {
               <th className="text-left font-semibold px-4 py-3">Stage</th>
               <th className="text-right font-semibold px-4 py-3">Survival (days)</th>
               <th className="text-left font-semibold px-4 py-3">Slides</th>
+              <th className="text-left font-semibold px-4 py-3">Report</th>
             </tr>
           </thead>
           <tbody>
@@ -184,14 +202,44 @@ export default function CohortExplorer({ datasetId }: { datasetId: number }) {
                           size="sm"
                           variant="outline"
                           title={slideTypeDescription(s.slide_type)}
-                          onClick={() =>
-                            setViewing({ slide: s, caseBarcode: c.case_barcode, caseId: c.case_id })
-                          }
+                          onClick={() => {
+                            setViewing({
+                              slide: s,
+                              reports: c.pathology_reports,
+                              caseBarcode: c.case_barcode,
+                              caseId: c.case_id,
+                            })
+                            setTab('slide')
+                          }}
                         >
                           <Eye className="h-3.5 w-3.5 mr-1" /> {slideTypeLabel(s.slide_type)}
                         </Button>
                       ))}
                     </div>
+                  )}
+                </td>
+                <td className="px-4 py-2.5">
+                  {c.pathology_reports.length === 0 ? (
+                    <span className="text-muted-foreground">—</span>
+                  ) : (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      title="Open the pathologist's report for this patient"
+                      onClick={() => {
+                        setViewing({
+                          slide: c.slides[0] ?? null,
+                          reports: c.pathology_reports,
+                          caseBarcode: c.case_barcode,
+                          caseId: c.case_id,
+                        })
+                        setTab('report')
+                      }}
+                    >
+                      <FileText className="h-3.5 w-3.5 mr-1" />
+                      PDF
+                      {c.pathology_reports.length > 1 ? ` (${c.pathology_reports.length})` : ''}
+                    </Button>
                   )}
                 </td>
               </tr>

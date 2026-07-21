@@ -6,6 +6,16 @@ Kept next to the models since these operate directly on the database.
 from Database.models import Dataset
 
 
+# Host/path fragment -> source type. Deliberately short: a source only earns an entry
+# here once a connector can actually load it. Anything else is "other" and gets its
+# compatibility report from analysis rather than a hardcoded guess (see shared/compat.py).
+SOURCE_PATTERNS = (
+    ("gdc.cancer.gov", "gdc"),
+    ("ncbi.nlm.nih.gov/geo", "geo"),
+    ("/geo/query/acc.cgi", "geo"),
+)
+
+
 def detect_source_type(url):
     """Classify a source URL so the download tool knows which connector (if any) fits.
 
@@ -13,13 +23,12 @@ def detect_source_type(url):
         url: The dataset's source link.
 
     Returns:
-        "gdc" (portal.gdc.cancer.gov), "geo" (NCBI GEO), or "other".
+        "gdc", "geo", or "other".
     """
     u = (url or "").lower()
-    if "gdc.cancer.gov" in u:
-        return "gdc"
-    if "ncbi.nlm.nih.gov/geo" in u or "/geo/" in u:
-        return "geo"
+    for fragment, source_type in SOURCE_PATTERNS:
+        if fragment in u:
+            return source_type
     return "other"
 
 

@@ -2,11 +2,13 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import {
   DownloadCloud, Eye, Trash2, Plus, AlertCircle, ExternalLink, X, HardDrive,
+  ClipboardCheck, CheckCircle2, MinusCircle, CircleSlash,
 } from 'lucide-react'
 import {
   fetchCatalog, addCatalog, deleteCatalog, fetchManifest, startDownload, fetchStorageTargets,
-  purgeDataset, fetchDatasetSummary,
+  purgeDataset, fetchDatasetSummary, checkSource, fetchCompatibility,
   type CatalogEntry, type Manifest, type StorageTargets, type DownloadJob,
+  type CompatReport, type CompatVerdict, type CompatFill,
 } from '@/lib/api'
 import { formatNumber, formatBytes, cn } from '@/lib/utils'
 import Section from '@/components/Section'
@@ -26,10 +28,30 @@ const SLIDE_TYPE_NOTE: Record<string, string> = {
     'Tissue slide (TS/BS): a frozen section cut alongside the tissue sent for sequencing, used to check its tumour content.',
 }
 
-function SourceBadge({ type }: { type: string }) {
-  if (type === 'gdc') return <Badge variant="gold">TCGA / GDC</Badge>
-  if (type === 'geo') return <Badge variant="secondary">GEO</Badge>
-  return <Badge variant="secondary">{type}</Badge>
+function SourceBadge({ type, label }: { type: string; label?: string }) {
+  const text = label || type
+  if (type === 'gdc') return <Badge variant="gold">{text}</Badge>
+  return <Badge variant="secondary">{text}</Badge>
+}
+
+// One verdict -> one badge. The wording answers "what do I do now?", not "how good is it?".
+const VERDICT_META: Record<CompatVerdict, { label: string; variant: 'success' | 'warning' | 'destructive' | 'secondary' }> = {
+  supported: { label: 'Ready to download', variant: 'success' },
+  partial: { label: 'Good fit — connector needed', variant: 'warning' },
+  needs_review: { label: 'Needs investigation', variant: 'warning' },
+  unsupported: { label: 'Cannot be automated', variant: 'destructive' },
+  unknown: { label: 'Unrecognised link', variant: 'secondary' },
+}
+
+function VerdictBadge({ verdict }: { verdict: CompatVerdict }) {
+  const meta = VERDICT_META[verdict] ?? VERDICT_META.unknown
+  return <Badge variant={meta.variant}>{meta.label}</Badge>
+}
+
+const FILL_META: Record<CompatFill, { icon: typeof CheckCircle2; label: string; className: string }> = {
+  full: { icon: CheckCircle2, label: 'Filled', className: 'text-green-700' },
+  partial: { icon: MinusCircle, label: 'Partly filled', className: 'text-amber-600' },
+  none: { icon: CircleSlash, label: 'Stays empty', className: 'text-muted-foreground' },
 }
 
 export default function AddData() {
@@ -47,6 +69,9 @@ export default function AddData() {
 
   const [manifest, setManifest] = useState<{ entryId: number; data: Manifest } | null>(null)
   const [manifestLoading, setManifestLoading] = useState<number | null>(null)
+
+  const [compat, setCompat] = useState<CompatReport | null>(null)
+  const [compatLoading, setCompatLoading] = useState(false)
 
   const [purgeTarget, setPurgeTarget] = useState<CatalogEntry | null>(null)
   const [purging, setPurging] = useState(false)
@@ -96,16 +121,45 @@ export default function AddData() {
     }
   }, [hasActive])
 
+  // Check a link before it is registered, so the user sees what they would get.
+  const onCheck = async (url: string) => {
+    if (!url.trim()) return
+    setCompatLoading(true)
+    try {
+      setCompat(await checkSource(url.trim()))
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Could not check that link')
+    } finally {
+      setCompatLoading(false)
+    }
+  }
+
+  // The same report for a row already in the registry.
+  const onCheckEntry = async (entry: CatalogEntry) => {
+    setCompatLoading(true)
+    try {
+      setCompat(await fetchCompatibility(entry.id))
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Could not check that entry')
+    } finally {
+      setCompatLoading(false)
+    }
+  }
+
   const onAdd = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!newName.trim() || !newUrl.trim()) return
     setAdding(true)
+    const url = newUrl.trim()
     try {
-      await addCatalog({ name: newName.trim(), source_url: newUrl.trim() })
+      await addCatalog({ name: newName.trim(), source_url: url })
       setNewName('')
       setNewUrl('')
       toast.success('Added to the registry')
       await load()
+      // Always show the report after adding — an unsupported source should say so
+      // immediately rather than leaving the user to wonder why Download is missing.
+      await onCheck(url)
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Could not add')
     } finally {
@@ -212,10 +266,23 @@ export default function AddData() {
               className="border rounded-md px-3 py-2 text-sm text-foreground bg-card w-full"
             />
           </label>
+          <Button
+            type="button"
+            variant="outline"
+            disabled={compatLoading || !newUrl.trim()}
+            onClick={() => onCheck(newUrl)}
+          >
+            <ClipboardCheck className="h-4 w-4 mr-1" /> {compatLoading ? 'Checking…' : 'Check link'}
+          </Button>
           <Button type="submit" disabled={adding || !newName.trim() || !newUrl.trim()}>
             <Plus className="h-4 w-4 mr-1" /> {adding ? 'Adding…' : 'Add'}
           </Button>
         </form>
+
+        <p className="mt-2 text-xs text-muted-foreground">
+          "Check link" reads the source and reports which tables it would fill before you commit.
+          Adding runs the same check automatically.
+        </p>
 
         <div className="mt-5 pt-4 border-t flex flex-wrap items-center gap-3">
           <span className="text-sm text-muted-foreground">Download destination:</span>
@@ -257,6 +324,9 @@ export default function AddData() {
         </div>
       </Section>
 
+      {/* Compatibility report — what this source would and would not fill */}
+      {compat && <CompatPanel report={compat} onClose={() => setCompat(null)} />}
+
       {/* Manifest preview — carries live per-file download progress for its dataset */}
       {manifest && (
         <ManifestPanel
@@ -291,7 +361,12 @@ export default function AddData() {
                         source <ExternalLink className="h-3 w-3" />
                       </a>
                     </td>
-                    <td className="px-4 py-3"><SourceBadge type={c.source_type} /></td>
+                    <td className="px-4 py-3">
+                      <div className="flex flex-col items-start gap-1">
+                        <SourceBadge type={c.source_type} label={c.source_label} />
+                        {!c.downloadable && <VerdictBadge verdict={c.verdict} />}
+                      </div>
+                    </td>
                     <td className="px-4 py-3 text-muted-foreground">{c.gi_cancer_types || '—'}</td>
                     <td className="px-4 py-3">
                       {running ? (
@@ -317,7 +392,16 @@ export default function AddData() {
                     </td>
                     <td className="px-4 py-3">
                       <div className="flex items-center justify-end gap-2">
-                        {c.downloadable ? (
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={compatLoading}
+                          onClick={() => onCheckEntry(c)}
+                          title="What would this fill, and what is missing?"
+                        >
+                          <ClipboardCheck className="h-3.5 w-3.5 mr-1" /> Check
+                        </Button>
+                        {c.downloadable && (
                           <>
                             <Button size="sm" variant="outline" disabled={manifestLoading === c.id} onClick={() => onPreview(c.id)}>
                               <Eye className="h-3.5 w-3.5 mr-1" /> {manifestLoading === c.id ? 'Loading…' : 'Preview'}
@@ -326,8 +410,6 @@ export default function AddData() {
                               <DownloadCloud className="h-3.5 w-3.5 mr-1" /> {c.ingested ? 'Re-download' : 'Download'}
                             </Button>
                           </>
-                        ) : (
-                          <span className="text-xs text-muted-foreground italic">connector needed</span>
                         )}
                         {c.ingested && c.dataset_id != null && (
                           <Button
@@ -460,6 +542,143 @@ function DestButton({
     >
       {children}
     </button>
+  )
+}
+
+/** Live facts read from the source, rendered as label/value pairs. */
+function ProbeFacts({ report }: { report: CompatReport }) {
+  const p = report.probe
+  if (!p) return null
+  const facts: Array<[string, string]> = []
+  if (p.n_cases != null) facts.push(['Patients', formatNumber(p.n_cases)])
+  if (p.n_samples != null) facts.push(['Samples', formatNumber(p.n_samples)])
+  if (p.n_slides != null) facts.push(['Slides available', formatNumber(p.n_slides)])
+  if (p.n_diagnostic_slides != null) facts.push(['— diagnostic (FFPE)', formatNumber(p.n_diagnostic_slides)])
+  if (p.n_tissue_slides != null) facts.push(['— tissue (frozen)', formatNumber(p.n_tissue_slides)])
+  if (p.total_mb != null) facts.push(['Total image size', formatBytes(p.total_mb * 1e6)])
+  if (p.assay_type) facts.push(['Assay', p.assay_type])
+  if (p.platform) facts.push(['Platform', p.platform])
+  if (p.organism) facts.push(['Organism', p.organism])
+  if (p.file_formats?.length) facts.push(['File formats', p.file_formats.join(', ')])
+  if (!facts.length) return null
+
+  return (
+    <div className="rounded-lg border bg-muted/30 p-4">
+      <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground mb-3">
+        Read from the source
+      </div>
+      {p.title && <p className="text-sm text-foreground mb-3">{p.title}</p>}
+      <dl className="grid grid-cols-2 gap-x-6 gap-y-1.5 sm:grid-cols-3">
+        {facts.map(([label, value]) => (
+          <div key={label} className="flex flex-col">
+            <dt className="text-xs text-muted-foreground">{label}</dt>
+            <dd className="text-sm font-medium text-foreground tabular-nums">{value}</dd>
+          </div>
+        ))}
+      </dl>
+    </div>
+  )
+}
+
+/**
+ * The compatibility report: whether the source can be loaded, which schema tables it
+ * would fill, and what to look into. Shown after "Check link" and after adding.
+ */
+function CompatPanel({ report, onClose }: { report: CompatReport; onClose: () => void }) {
+  const filled = report.tables.filter((t) => t.fill !== 'none')
+
+  return (
+    <Section
+      title={`Compatibility — ${report.name || report.accession || report.source_label}`}
+      icon={ClipboardCheck}
+      description={report.headline}
+      action={
+        <Button size="sm" variant="ghost" onClick={onClose}>
+          <X className="h-4 w-4" />
+        </Button>
+      }
+    >
+      <div className="space-y-4">
+        <div className="flex flex-wrap items-center gap-2">
+          <VerdictBadge verdict={report.verdict} />
+          <SourceBadge type={report.source_type} label={report.source_label} />
+          <span className="text-sm text-muted-foreground">
+            Would fill {filled.length} of {report.n_tables_total} tables
+            {report.connector ? ` · connector: ${report.connector}` : ' · no connector yet'}
+          </span>
+        </div>
+
+        {report.probe_error && (
+          <div className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">
+            <AlertCircle className="h-4 w-4 mt-0.5 shrink-0" />
+            <span>
+              Live details could not be read, so this report is based on the source type alone.
+              {' '}{report.probe_error}
+            </span>
+          </div>
+        )}
+
+        <ProbeFacts report={report} />
+
+        <div className="overflow-x-auto rounded-lg border">
+          <table className="w-full text-sm">
+            <thead className="bg-muted">
+              <tr>
+                <th className="text-left font-semibold px-4 py-2">Table</th>
+                <th className="text-left font-semibold px-4 py-2">Holds</th>
+                <th className="text-left font-semibold px-4 py-2">Result</th>
+              </tr>
+            </thead>
+            <tbody>
+              {report.tables.map((t, i) => {
+                const meta = FILL_META[t.fill]
+                const Icon = meta.icon
+                return (
+                  <tr key={t.table} className={i % 2 === 0 ? 'bg-card' : 'bg-muted/40'}>
+                    <td className="px-4 py-2 font-medium text-foreground whitespace-nowrap">{t.label}</td>
+                    <td className="px-4 py-2 text-muted-foreground">{t.description}</td>
+                    <td className="px-4 py-2">
+                      <div className={cn('flex items-start gap-1.5', meta.className)}>
+                        <Icon className="h-4 w-4 mt-0.5 shrink-0" />
+                        <div>
+                          <div className="font-medium">{meta.label}</div>
+                          {t.note && <div className="text-xs text-muted-foreground mt-0.5">{t.note}</div>}
+                        </div>
+                      </div>
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
+
+        {report.warnings.length > 0 && (
+          <div>
+            <h4 className="text-sm font-semibold text-foreground mb-2">Worth knowing</h4>
+            <ul className="space-y-1.5">
+              {report.warnings.map((w) => (
+                <li key={w} className="flex items-start gap-2 text-sm text-muted-foreground">
+                  <AlertCircle className="h-4 w-4 mt-0.5 shrink-0 text-amber-600" />
+                  <span>{w}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        {report.next_steps.length > 0 && (
+          <div>
+            <h4 className="text-sm font-semibold text-foreground mb-2">What to do next</h4>
+            <ol className="space-y-1.5 list-decimal list-inside">
+              {report.next_steps.map((s) => (
+                <li key={s} className="text-sm text-muted-foreground">{s}</li>
+              ))}
+            </ol>
+          </div>
+        )}
+      </div>
+    </Section>
   )
 }
 

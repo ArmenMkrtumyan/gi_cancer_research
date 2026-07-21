@@ -59,7 +59,8 @@ asset_layer = Enum("bronze", "silver", "gold", name="asset_layer")
 # the same transaction that uses the new value, which makes enums a poor fit for a
 # migration-driven workflow. Same typing policy the clinical vocabularies already use.
 # ---------------------------------------------------------------------------
-ASSET_TYPES = ("wsi", "annotation_source", "annotation_mask", "annotation_vector", "rendering_cache")
+ASSET_TYPES = ("wsi", "annotation_source", "annotation_mask", "annotation_vector",
+               "rendering_cache", "pathology_report")
 ANNOTATION_ORIGINS = ("source_provided", "published_derived")
 ANNOTATION_METHODS = ("manual", "algorithmic", "mixed", "not_reported")
 # Scopes that are inherently spatial: they describe a location *on a slide*, so they
@@ -481,6 +482,10 @@ class DataAsset(Base):
     asset types can be added by a plain migration. `derived_from_asset_id` keeps the
     original published annotation file distinct from any viewer-compatible derivative
     generated from it — the original is never overwritten.
+
+    `slide_id` and `case_id` are both optional and not mutually exclusive: a `wsi` names
+    its slide, a `pathology_report` names its case (GDC publishes reports per case, not
+    per slide), and a derivative may name both.
     """
 
     __tablename__ = "data_assets"
@@ -491,6 +496,7 @@ class DataAsset(Base):
     asset_id = Column(Integer, primary_key=True, autoincrement=True)
     dataset_id = Column(Integer, ForeignKey("datasets.dataset_id"), nullable=False, index=True)
     slide_id = Column(UUID(as_uuid=False), ForeignKey("slides.slide_id"), index=True)  # set for wsi
+    case_id = Column(UUID(as_uuid=False), ForeignKey("cases.case_id"), index=True)  # set for pathology_report
     asset_type = Column(String)
     layer = Column(asset_layer)
     uri = Column(String, nullable=False)  # s3://gi-cancer/bronze/TCGA-COAD/slides/<file>.svs

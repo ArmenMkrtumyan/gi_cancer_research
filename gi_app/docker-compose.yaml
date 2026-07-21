@@ -18,6 +18,15 @@ x-database-env: &database-env
     - AWS_S3_SECRET_KEY=${AWS_S3_SECRET_KEY:-}
     - AWS_S3_BUCKET=${AWS_S3_BUCKET:-}
     - AWS_S3_REGION=${AWS_S3_REGION:-}
+    # Gemini key for analysing source links that have no connector (blank = the
+    # "Check link" report degrades to "not analysed" instead of failing).
+    - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+    # flash-lite: 1,000 requests/day on the free tier vs 20 for gemini-2.5-flash
+    # (Google cut flash's RPD in Dec 2025). Quota is per PROJECT, not per key, so
+    # extra keys on one project add nothing. gemini-3.x returns 429 for grounded
+    # calls on the free tier. Don't change this without re-testing both calls in
+    # shared/analysis.py — see the gemini-free-tier-constraints note.
+    - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.5-flash-lite}
     - PYTHONPATH=/shared:/etl
 
 x-db-dependency: &db-dependency

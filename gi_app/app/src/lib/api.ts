@@ -226,8 +226,11 @@ export function fetchIngestionRuns(datasetId?: number): Promise<IngestionRun[]> 
   return getJson<IngestionRun[]>(`/ingestion-runs?${params}`)
 }
 
-export function fetchDownloadUrl(assetId: number, expires = 3600): Promise<DownloadUrl> {
-  return getJson<DownloadUrl>(`/assets/${assetId}/download-url?expires=${expires}`)
+/** Signed link to an asset. `inline` renders in the browser (PDFs) instead of downloading. */
+export function fetchDownloadUrl(assetId: number, expires = 3600, inline = false): Promise<DownloadUrl> {
+  return getJson<DownloadUrl>(
+    `/assets/${assetId}/download-url?expires=${expires}&inline=${inline}`,
+  )
 }
 
 // ---- cohort explorer + slide viewer -----------------------------------------
@@ -236,6 +239,12 @@ export interface CaseSlide {
   asset_id: number
   slide_barcode: string | null
   slide_type: string | null
+}
+
+export interface CaseReport {
+  asset_id: number
+  file_name: string | null
+  size_bytes: number | null
 }
 
 export interface CohortCase {
@@ -247,6 +256,7 @@ export interface CohortCase {
   os_time: number | null
   os_event: number | null
   slides: CaseSlide[]
+  pathology_reports: CaseReport[]
 }
 
 export function fetchCases(datasetId: number): Promise<CohortCase[]> {
@@ -314,13 +324,70 @@ export interface CatalogEntry {
   id: number
   name: string
   source_url: string
-  source_type: string // gdc | geo | other
+  source_type: string // gdc | geo | idc | tcia | pdc | dbgap | cbioportal | xena | synapse | seer | other
+  source_label: string // human-readable source name ("TCGA / GDC", "NCBI GEO", …)
+  verdict: CompatVerdict
   gi_cancer_types: string | null
   notes: string | null
   downloadable: boolean
   ingested: boolean
   dataset_id: number | null // the ingested dataset (present when `ingested`); target for purge
   latest_job: DownloadJob | null
+}
+
+/** How completely a source can populate one schema table. */
+export type CompatFill = 'full' | 'partial' | 'none'
+
+/** Overall answer to "can this link be loaded?", worst to best. */
+export type CompatVerdict = 'unknown' | 'unsupported' | 'needs_review' | 'partial' | 'supported'
+
+export interface CompatTable {
+  table: string
+  label: string
+  description: string
+  fill: CompatFill
+  note: string | null
+}
+
+/** Live facts read from the source itself. Shape varies by source, so fields are optional. */
+export interface CompatProbe {
+  accession?: string
+  title?: string
+  summary?: string
+  n_cases?: number
+  n_samples?: number
+  n_slides?: number
+  n_diagnostic_slides?: number
+  n_tissue_slides?: number
+  total_mb?: number
+  assay_type?: string
+  organism?: string
+  platform?: string
+  file_formats?: string[]
+  has_images?: boolean
+  image_formats?: string[]
+  pubmed_ids?: string[]
+  ftp?: string
+}
+
+export interface CompatReport {
+  source_url: string
+  source_type: string
+  source_label: string
+  connector: string | null
+  downloadable: boolean
+  verdict: CompatVerdict
+  headline: string
+  accession: string | null
+  probe: CompatProbe | null
+  probe_error: string | null
+  warnings: string[]
+  next_steps: string[]
+  tables: CompatTable[]
+  n_tables_filled: number
+  n_tables_total: number
+  catalog_id?: number
+  name?: string
 }
 
 export interface PurgeResult {
@@ -379,6 +446,16 @@ export function fetchCatalog(): Promise<CatalogEntry[]> {
 
 export function addCatalog(body: { name: string; source_url: string; gi_cancer_types?: string }): Promise<{ id: number }> {
   return sendJson('POST', '/catalog', body)
+}
+
+/** Compatibility report for a link that has not been registered yet. */
+export function checkSource(sourceUrl: string, live = true): Promise<CompatReport> {
+  return sendJson<CompatReport>('POST', '/catalog/check', { source_url: sourceUrl, live })
+}
+
+/** The same report for an entry already in the registry. */
+export function fetchCompatibility(id: number, live = true): Promise<CompatReport> {
+  return getJson<CompatReport>(`/catalog/${id}/compatibility?live=${live}`)
 }
 
 export function deleteCatalog(id: number): Promise<{ deleted: number }> {

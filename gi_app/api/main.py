@@ -21,6 +21,7 @@ from pydantic import BaseModel
 from sqlalchemy import distinct, func, text
 from sqlalchemy.orm import Session
 
+import compat
 import storage
 import wsi
 from Database.database import get_db, SessionLocal
@@ -309,7 +310,9 @@ def _asset_payload(asset: DataAsset, slide: Optional[Slide] = None,
         "slide_type": slide.slide_type if slide else None,
         "sample_id": sample.sample_id if sample else None,
         "sample_barcode": sample.submitter_id if sample else None,
-        "case_id": case.case_id if case else None,
+        # Case-scoped assets (pathology reports) carry case_id directly; slide-scoped ones
+        # reach it through the joined slide, so fall back rather than reporting None.
+        "case_id": case.case_id if case else asset.case_id,
         "case_barcode": case.submitter_id if case else None,
     }
 
@@ -868,6 +871,19 @@ def dataset_cases(dataset_id: int, db: Session = Depends(get_db)):
             {"asset_id": aid, "slide_barcode": barcode, "slide_type": slide_type}
         )
 
+    # Pathology-report PDFs per case. Unlike slides (sampled, so most patients have none)
+    # GDC publishes one report per case, so this is normally populated for everyone.
+    reports_by_case: dict = {}
+    for aid, cid, uri, size in (
+        db.query(DataAsset.asset_id, DataAsset.case_id, DataAsset.uri, DataAsset.size_bytes)
+        .filter(DataAsset.dataset_id == dataset_id,
+                DataAsset.asset_type == "pathology_report")
+        .all()
+    ):
+        reports_by_case.setdefault(cid, []).append(
+            {"asset_id": aid, "file_name": _filename(uri), "size_bytes": _count(size)}
+        )
+
     cases = db.query(Case).filter(Case.dataset_id == dataset_id).order_by(Case.submitter_id).all()
     return [
         {
@@ -879,6 +895,7 @@ def dataset_cases(dataset_id: int, db: Session = Depends(get_db)):
             "os_time": surv.get(str(c.case_id), (None, None))[0],
             "os_event": surv.get(str(c.case_id), (None, None))[1],
             "slides": slides_by_case.get(c.case_id, []),
+            "pathology_reports": reports_by_case.get(c.case_id, []),
         }
         for c in cases
     ]
@@ -926,15 +943,24 @@ def get_asset(asset_id: int, db: Session = Depends(get_db)):
     return _asset_payload(asset, slide, sample, case)
 
 
+# Content types for the formats we register. Objects are stored without one, so the
+# signed link has to declare it or the browser downloads everything as a binary blob.
+_ASSET_CONTENT_TYPES = {"pdf": "application/pdf", "png": "image/png", "jpg": "image/jpeg"}
+
+
 @app.get("/assets/{asset_id}/download-url")
 def get_asset_download_url(asset_id: int, expires: int = Query(3600, ge=60, le=86400),
+                           inline: bool = Query(False, description="Render in the browser "
+                                                "instead of downloading (PDFs, images)"),
                            db: Session = Depends(get_db)):
     """Return a temporary signed URL for an object-storage asset."""
     asset = db.query(DataAsset).filter(DataAsset.asset_id == asset_id).one_or_none()
     if asset is None:
         raise HTTPException(status_code=404, detail=f"Asset {asset_id} not found")
+    content_type = _ASSET_CONTENT_TYPES.get((asset.format or "").lower()) if inline else None
     try:
-        url = storage.url_for(asset.uri, expires=expires)
+        url = storage.url_for(asset.uri, expires=expires,
+                              content_type=content_type, inline=inline)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Could not sign asset URL: {exc}") from exc
     return {"asset_id": asset.asset_id, "uri": asset.uri, "expires": expires, "url": url}
@@ -1367,6 +1393,12 @@ def get_case(case_id: str, db: Session = Depends(get_db)):
         .order_by(Slide.submitter_id)
         .all()
     )
+    reports = (
+        db.query(DataAsset)
+        .filter(DataAsset.case_id == case_id, DataAsset.asset_type == "pathology_report")
+        .order_by(DataAsset.asset_id)
+        .all()
+    )
     n_ann = _count(db.query(func.count(Annotation.annotation_id))
                    .filter(Annotation.case_id == case_id).scalar())
     return {
@@ -1387,6 +1419,13 @@ def get_case(case_id: str, db: Session = Depends(get_db)):
             {"slide_id": s.slide_id, "slide_barcode": s.submitter_id,
              "slide_type": s.slide_type, "asset_id": a.asset_id}
             for s, a in slides
+        ],
+        # The pathologist's report PDF(s) for this patient. Fetch the bytes via
+        # /assets/{asset_id}/download-url — the file lives in object storage, not the DB.
+        "pathology_reports": [
+            {"asset_id": r.asset_id, "file_name": _filename(r.uri),
+             "size_bytes": _count(r.size_bytes)}
+            for r in reports
         ],
     }
 
@@ -1429,6 +1468,11 @@ class CatalogCreate(BaseModel):
     notes: Optional[str] = None
 
 
+class CompatCheck(BaseModel):
+    source_url: str
+    live: bool = True  # probe the source for real counts; False keeps it offline/instant
+
+
 class ManifestRequest(BaseModel):
     limit: Optional[int] = 6  # total slides to sample; 0/None = all (full)
 
@@ -1467,14 +1511,19 @@ def list_catalog(db: Session = Depends(get_db)):
             .order_by(DownloadJob.id.desc())
             .first()
         )
+        # Only whether a connector exists — cheap and always true. Anything richer needs
+        # the per-entry /compatibility endpoint, which may hit the network.
+        has_connector = c.source_type in compat.CONNECTOR_REPORTS
         out.append({
             "id": c.id,
             "name": c.name,
             "source_url": c.source_url,
             "source_type": c.source_type,
+            "source_label": "TCGA / GDC" if c.source_type == "gdc" else c.source_type,
+            "verdict": compat.SUPPORTED if has_connector else compat.UNKNOWN,
             "gi_cancer_types": c.gi_cancer_types,
             "notes": c.notes,
-            "downloadable": c.source_type == "gdc",
+            "downloadable": has_connector,
             "ingested": c.name in ds_by_name,
             "dataset_id": ds_by_name.get(c.name),  # the ingested dataset to purge, if any
             "latest_job": _job_payload(latest) if latest else None,
@@ -1497,6 +1546,31 @@ def add_catalog(body: CatalogCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(entry)
     return {"id": entry.id, "name": entry.name, "source_type": entry.source_type}
+
+
+@app.post("/catalog/check")
+def check_source(body: CompatCheck):
+    """Compatibility report for a link, before it is registered.
+
+    Says which source it is, whether a connector exists, which schema tables it would
+    fill, and what needs investigating. Read-only — nothing is stored.
+    """
+    url = (body.source_url or "").strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="A source link is required.")
+    return compat.build_report(url, live=body.live)
+
+
+@app.get("/catalog/{catalog_id}/compatibility")
+def catalog_compatibility(catalog_id: int, live: bool = Query(True), db: Session = Depends(get_db)):
+    """The same report for an already-registered entry."""
+    entry = db.get(DownloadCatalog, catalog_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Catalog entry {catalog_id} not found")
+    report = compat.build_report(entry.source_url, source_type=entry.source_type, live=live)
+    report["catalog_id"] = entry.id
+    report["name"] = entry.name
+    return report
 
 
 @app.delete("/catalog/{catalog_id}")

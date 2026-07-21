@@ -1,7 +1,7 @@
 # API service deps (layered on shared/requirements-base.txt)
 fastapi==0.121.1
 uvicorn==0.32.1
-pydantic==2.12.4
+pydantic==2.12.5  # floor set by google-genai 2.x; do not drop below
 boto3==1.35.76
 
 # WSI deep-zoom tiling. openslide-bin ships the native OpenSlide library as a wheel,
@@ -16,3 +16,10 @@ openslide-bin
 # parquet files used to match our slides against public annotation collections.
 pydicom==3.0.1
 pyarrow==18.1.0
+
+# Source-link analysis for links with no connector (shared/analysis.py). Uses the
+# Gemini free tier: Google Search grounding reads the dataset page, and a response
+# schema forces the answer into the same report shape the connector path returns.
+# 2.x is required: the Interactions API rejects the 1.x request schema outright
+# ("legacy Interactions API schema is no longer supported", May 2026 breaking change).
+google-genai==2.12.1

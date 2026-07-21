@@ -203,17 +203,31 @@ def download_file(uri: str, local_path: str, target: str = None) -> None:
     client(target or target_for_uri(uri)).download_file(bucket, key, local_path)
 
 
-def url_for(uri: str, expires: int = 3600) -> str:
+def url_for(uri: str, expires: int = 3600, content_type: str = None,
+            inline: bool = False) -> str:
     """Make a temporary download link for an object.
+
+    Objects are uploaded without a declared content type, so MinIO serves them as
+    binary/octet-stream and a browser downloads them instead of rendering. Passing
+    `content_type` (and `inline`) overrides that per-link via the response-header
+    parameters, which are part of the signature — so this cannot be tampered with
+    after signing.
 
     Args:
         uri: The object's s3:// URI.
         expires: Link lifetime in seconds (default 3600).
+        content_type: Override the Content-Type header, e.g. 'application/pdf'.
+        inline: Ask the browser to display rather than download.
 
     Returns:
         A presigned GET URL valid for `expires` seconds.
     """
     bucket, key = parse_s3_uri(uri)
+    params = {"Bucket": bucket, "Key": key}
+    if content_type:
+        params["ResponseContentType"] = content_type
+    if inline:
+        params["ResponseContentDisposition"] = "inline"
     return presign_client().generate_presigned_url(
-        "get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=expires
+        "get_object", Params=params, ExpiresIn=expires
     )
